@@ -436,7 +436,7 @@ impl<Role> Session<Role, EventCollector> {
     }
 }
 
-fn with_pointer<T>(
+pub(crate) fn with_pointer<T>(
     raw: *mut RawSession,
     operation: impl FnOnce(&crate::context::SessionPtr<'_>) -> Result<T>,
 ) -> Result<T> {
@@ -597,3 +597,7 @@ impl SessionCtx<'_> {
     }
     session_api!();
 }
+
+#[cfg(test)]
+#[path = "../tests/support/session_poison.rs"]
+mod poison_tests;

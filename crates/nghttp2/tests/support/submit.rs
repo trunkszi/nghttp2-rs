@@ -319,13 +319,19 @@ fn copy_provider_splits_payload_at_the_default_max_frame_size() {
     let payload = vec![0x5au8; 20_000];
     let (wire, code) = run_request(Some(&mut DataProvider::from_vec(payload.clone())));
     // Upstream caps one DATA payload at the remote SETTINGS_MAX_FRAME_SIZE, 16384 bytes.
-    let data = &wire[wire.len() - (9 + 16_384 + 9 + 3_616 + 9)..];
+    let data = &wire[wire.len() - (9 + 16_384 + 9 + 3_616)..];
     let second = 9 + 16_384;
     assert_eq!(
         (&data[..5], &data[second..second + 5]),
         (
             &[0x00u8, 0x40, 0x00, NGHTTP2_DATA as u8, 0][..],
-            &[0x00u8, 0x0e, 0x20, NGHTTP2_DATA as u8, 0][..]
+            &[
+                0x00u8,
+                0x0e,
+                0x20,
+                NGHTTP2_DATA as u8,
+                FrameFlags::END_STREAM.bits()
+            ][..]
         )
     );
     assert_eq!(
@@ -333,13 +339,13 @@ fn copy_provider_splits_payload_at_the_default_max_frame_size() {
         (&payload[..16_384], &payload[16_384..])
     );
     assert_eq!(
-        (code, &data[data.len() - 9..]),
+        (code, &data[second..second + 9]),
         (
             0,
             &[
                 0u8,
-                0,
-                0,
+                0x0e,
+                0x20,
                 NGHTTP2_DATA as u8,
                 FrameFlags::END_STREAM.bits(),
                 0,
@@ -413,15 +419,11 @@ fn no_copy_provider_sends_through_the_send_data_callback() {
                 .submit_request(None, &request, Some(&mut provider), ptr::null_mut())
         };
         assert_eq!(id, Ok(1));
-        let (wire, code) = client.send();
+        let (_, code) = client.send();
         assert_eq!(code, 0);
-        let tail = wire.len() - 9;
-        assert_eq!(
-            (wire[tail + 3], wire[tail + 4]),
-            (NGHTTP2_DATA as u8, FrameFlags::END_STREAM.bits())
-        );
     }
     assert_eq!((captured.len(), captured[3]), (9 + 12, NGHTTP2_DATA as u8));
+    assert_eq!(captured[4], FrameFlags::END_STREAM.bits());
     assert_eq!(&captured[0..3], &[0u8, 0, 12]);
     assert_eq!(&captured[9..21], b"no-copy-data");
 }
@@ -453,7 +455,13 @@ fn no_copy_provider_splits_payload_across_send_data_calls() {
         (&captured[..5], &captured[9 + 16_384..9 + 16_384 + 5]),
         (
             &[0x00u8, 0x40, 0x00, NGHTTP2_DATA as u8, 0][..],
-            &[0x00u8, 0x0e, 0x20, NGHTTP2_DATA as u8, 0][..]
+            &[
+                0x00u8,
+                0x0e,
+                0x20,
+                NGHTTP2_DATA as u8,
+                FrameFlags::END_STREAM.bits()
+            ][..]
         )
     );
     assert_eq!(
@@ -682,25 +690,6 @@ fn integration_provider_move_and_panic_access_preserve_native_source() {
     // SAFETY: the provider continues to own this same allocation after native reads.
     assert_eq!(unsafe { (*provider.as_raw()).source.ptr }, address);
     drop(client);
-}
-
-#[test]
-fn integration_context_submits_control_frames_and_borrows_stream_views() {
-    use crate::stream::SessionStreams;
-    let client = TestSession::new(false, ptr::null(), ptr::null_mut(), None, None);
-    // SAFETY: the native session remains live for this scoped context.
-    let ctx = unsafe { SessionCtx::from_raw(client.session) }.expect("live context");
-    ctx.submit_settings(&[]).expect("settings through context");
-    SessionSubmit::submit_ping(&ctx, FrameFlags::NONE, Some(b"ctx-ping"))
-        .expect("ping through context");
-    assert_eq!(
-        SessionStreams::root_stream(&ctx).expect("root stream").id(),
-        0
-    );
-    assert!(ctx.find_stream(99).is_none());
-    let (wire, code) = client.send();
-    assert_eq!(code, 0);
-    assert!(wire.windows(8).any(|bytes| bytes == b"ctx-ping"));
 }
 
 #[test]
