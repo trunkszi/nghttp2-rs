@@ -1,17 +1,18 @@
 //! Header name/value descriptors.
 //!
-//! An [`nghttp2_nv`] is a borrowed view. The name and value pointers must remain
-//! valid until `nghttp2` has finished encoding the frame that references them. The
-//! `NO_COPY` flags let callers keep ownership of the buffers; with those flags
-//! clear the library copies the bytes into a single allocation owned by the frame.
+//! An [`nghttp2_nv`] is a borrowed view. With the `NO_COPY` flags set the library
+//! queues the caller's pointers and reads them when the frame is packed, so the
+//! buffers must stay valid and unmodified until `nghttp2_on_frame_send_callback`
+//! or `nghttp2_on_frame_not_send_callback` fires. With those flags clear it
+//! copies the bytes into one allocation owned by the frame. `NO_COPY_NAME` also
+//! skips the library's lowercasing, so the name must already be lowercase.
 //!
 //! [`HeaderField`] is the borrowed form, [`OwnedHeader`] the owning form, and
-//! [`NvFlags`] the typed flag set shared by both. The `nv!` macro embeds the bytes
-//! of a string literal in the binary, so a descriptor can be a constant and still
-//! take the zero-copy path.
+//! [`NvFlags`] the typed flag set shared by both. The `nv!` macro embeds literal
+//! bytes in the binary, which makes them suitable for the zero-copy path.
 //!
-//! Validation delegates to the C helpers, so a caller sees exactly the rules the
-//! library applies when it receives or submits headers.
+//! The `check_*` and `validate*` routines cover the character-level rules those C
+//! helpers enforce; the session layer applies the remaining messaging checks.
 
 pub use nghttp2_macros::nv;
 pub use nghttp2_sys::{
@@ -46,13 +47,13 @@ impl NvFlags {
     /// Do not add the field to the HPACK dynamic table.
     pub const NO_INDEX: Self = Self(NGHTTP2_NV_FLAG_NO_INDEX as u8);
 
-    /// The caller keeps ownership of the name buffer.
+    /// The caller keeps ownership of the name buffer and must pass it in lowercase.
     pub const NO_COPY_NAME: Self = Self(NGHTTP2_NV_FLAG_NO_COPY_NAME as u8);
 
     /// The caller keeps ownership of the value buffer.
     pub const NO_COPY_VALUE: Self = Self(NGHTTP2_NV_FLAG_NO_COPY_VALUE as u8);
 
-    /// The caller keeps ownership of both buffers.
+    /// Both buffers stay caller-owned; the name must already be lowercase.
     pub const NO_COPY: Self = Self::NO_COPY_NAME.union(Self::NO_COPY_VALUE);
 
     /// Both buffers stay under caller ownership and the field is not indexed.
@@ -148,10 +149,10 @@ impl<'a> HeaderField<'a> {
     /// them that way. The bytes behind them are never written through, and the
     /// library does not free them while the `NO_COPY` flags are set.
     ///
-    /// The descriptor borrows the field's bytes, so it stays valid only while the
-    /// source data does: [`METHOD_POST`] and every `nv!` product point into the
-    /// binary, while a caller-owned buffer expires with the borrow. Pass it
-    /// straight to a submission call and do not keep it past the bytes' lifetime.
+    /// The descriptor borrows the field's bytes. [`METHOD_POST`] and every `nv!`
+    /// product point into the binary; a caller-owned buffer must stay alive and
+    /// unmodified until the frame is sent or abandoned, because submission only
+    /// queues the pointers.
     pub const fn as_raw(&self) -> RawHeaderField {
         RawHeaderField {
             name: self.name.as_ptr().cast_mut(),
@@ -162,8 +163,7 @@ impl<'a> HeaderField<'a> {
         }
     }
 
-    /// Validates the field with the HTTP/2 rules the library applies to inbound
-    /// headers.
+    /// Validates the field with the character-level HTTP/2 rules for inbound headers.
     ///
     /// The name must be non-empty, may carry one leading `:`, and every remaining
     /// byte must be an RFC 9113 token character, so uppercase fails. The value must
@@ -184,7 +184,7 @@ impl<'a> HeaderField<'a> {
         Ok(())
     }
 
-    /// Validates the field with the stricter RFC 9113 rules used for submission.
+    /// Validates the field with the stricter RFC 9113 character rules before submission.
     ///
     /// The name rules are the same as [`HeaderField::validate`]. A `:authority` or
     /// `host` value must consist only of authority characters and must not carry
@@ -232,9 +232,8 @@ pub fn check_header_name(name: &[u8]) -> bool {
 
 /// Whether a header value is valid.
 ///
-/// HTAB, SP, and bytes 0x21..=0xFF except DEL (0x7F) are accepted; CR, LF, NUL,
-/// and the remaining control bytes are rejected. This matches the rules the
-/// library applies to received header fields.
+/// HTAB, SP, and bytes 0x21..=0xFF except DEL (0x7F) are accepted; every other
+/// control byte is rejected, matching the rules for received fields.
 #[must_use]
 pub fn check_header_value(value: &[u8]) -> bool {
     // SAFETY: `value` is a live slice, so the pointer and length describe
@@ -257,9 +256,8 @@ pub fn check_header_value_rfc9113(value: &[u8]) -> bool {
 
 /// Whether an authority value is valid.
 ///
-/// The empty value is valid. Otherwise every byte must be allowed in a URI
-/// authority: alphanumerics and `!$%&'()*+,-.:;=@[]_~`, which covers
-/// percent-encoded reg-names. Space, `/`, `?`, and `#` are rejected.
+/// Empty is valid. Otherwise every byte must be allowed in a URI authority:
+/// alphanumerics and `!$%&'()*+,-.:;=@[]_~`; space, `/`, `?`, and `#` are rejected.
 #[must_use]
 pub fn check_authority(authority: &[u8]) -> bool {
     // SAFETY: `authority` is a live slice, so the pointer and length describe
@@ -322,16 +320,15 @@ impl OwnedHeader {
 
     /// Builds the raw descriptor that `nghttp2` submission calls expect.
     ///
-    /// The descriptor points into this header's buffers. It is valid only while
-    /// the borrow of `self` is held, since the `Vec` may reallocate or be dropped
-    /// afterwards. The `*mut` fields are never written through, and the library
-    /// does not free the buffers while the `NO_COPY` flags are set.
+    /// The descriptor points into this header's buffers, so `self` must outlive
+    /// the queued frame: dropping it or moving a vector after submission leaves
+    /// nghttp2 with dangling pointers. The `*mut` fields are never written
+    /// through, and the library does not free the buffers under `NO_COPY`.
     pub fn as_raw(&self) -> RawHeaderField {
         self.as_field().as_raw()
     }
 
-    /// Validates the field with the HTTP/2 rules the library applies to inbound
-    /// headers.
+    /// Validates the field with the character-level HTTP/2 rules for inbound headers.
     ///
     /// See [`HeaderField::validate`] for the exact name and value rules.
     ///
@@ -343,7 +340,7 @@ impl OwnedHeader {
         self.as_field().validate()
     }
 
-    /// Validates the field with the stricter RFC 9113 rules used for submission.
+    /// Validates the field with the stricter RFC 9113 character rules before submission.
     ///
     /// See [`HeaderField::validate_rfc9113`] for the exact rules.
     ///

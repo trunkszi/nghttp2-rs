@@ -25,6 +25,10 @@ use syn::{Ident, ImplItem, ItemImpl, LitByteStr, LitStr, Token, parse_macro_inpu
 /// `NGHTTP2_NV_FLAG_NO_INDEX`, which keeps `nghttp2` from inserting the field
 /// into its HPACK dynamic table.
 ///
+/// The name must already be lowercase: `NGHTTP2_NV_FLAG_NO_COPY_NAME` skips the
+/// library's downcasing. The bytes live in the binary, so they never expire; a
+/// descriptor built from caller-owned buffers carries that obligation instead.
+///
 /// The expansion refers to the `nghttp2` crate by name and deliberately omits a
 /// leading `::`, because the `nghttp2` crate is itself a caller and resolves its
 /// own name through an internal alias. The calling module must have `nghttp2` in
