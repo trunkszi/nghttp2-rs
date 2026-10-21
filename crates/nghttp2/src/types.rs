@@ -91,7 +91,23 @@ impl ErrorCode {
 
 impl fmt::Display for ErrorCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.write_str(self.message())
+        match *self {
+            Self::NO_ERROR => f.write_str("NO_ERROR"),
+            Self::PROTOCOL_ERROR => f.write_str("PROTOCOL_ERROR"),
+            Self::INTERNAL_ERROR => f.write_str("INTERNAL_ERROR"),
+            Self::FLOW_CONTROL_ERROR => f.write_str("FLOW_CONTROL_ERROR"),
+            Self::SETTINGS_TIMEOUT => f.write_str("SETTINGS_TIMEOUT"),
+            Self::STREAM_CLOSED => f.write_str("STREAM_CLOSED"),
+            Self::FRAME_SIZE_ERROR => f.write_str("FRAME_SIZE_ERROR"),
+            Self::REFUSED_STREAM => f.write_str("REFUSED_STREAM"),
+            Self::CANCEL => f.write_str("CANCEL"),
+            Self::COMPRESSION_ERROR => f.write_str("COMPRESSION_ERROR"),
+            Self::CONNECT_ERROR => f.write_str("CONNECT_ERROR"),
+            Self::ENHANCE_YOUR_CALM => f.write_str("ENHANCE_YOUR_CALM"),
+            Self::INADEQUATE_SECURITY => f.write_str("INADEQUATE_SECURITY"),
+            Self::HTTP_1_1_REQUIRED => f.write_str("HTTP_1_1_REQUIRED"),
+            Self(raw) => write!(f, "UNKNOWN(0x{raw:08x})"),
+        }
     }
 }
 
@@ -423,7 +439,7 @@ impl HeadersCategory {
     pub const RESPONSE: Self = Self(nghttp2_sys::NGHTTP2_HCAT_RESPONSE);
     /// Push-response headers.
     pub const PUSH_RESPONSE: Self = Self(nghttp2_sys::NGHTTP2_HCAT_PUSH_RESPONSE);
-    /// Trailer headers.
+    /// Trailers or non-final (1xx) response headers.
     pub const HEADERS: Self = Self(nghttp2_sys::NGHTTP2_HCAT_HEADERS);
 
     /// Wraps a raw category value.
@@ -445,7 +461,7 @@ impl fmt::Display for HeadersCategory {
             Self::REQUEST => f.write_str("request"),
             Self::RESPONSE => f.write_str("response"),
             Self::PUSH_RESPONSE => f.write_str("push response"),
-            Self::HEADERS => f.write_str("trailers"),
+            Self::HEADERS => f.write_str("HEADERS"),
             Self(raw) => write!(f, "UNKNOWN(0x{raw:08x})"),
         }
     }
@@ -529,21 +545,30 @@ impl AlpnProtocol {
     }
 }
 
+/// Largest list accepted by [`select_next_protocol`].
+///
+/// The C parser advances through the list with `unsigned int` arithmetic; at or
+/// above this length its `i + keylen` check can wrap and read past the slice.
+const MAX_ALPN_LIST_LEN: usize = u32::MAX as usize - 256;
+
+fn checked_alpn_len(len: usize) -> Option<u32> {
+    (len <= MAX_ALPN_LIST_LEN).then_some(len as u32)
+}
+
 /// Selects the protocol to advertise for a peer's ALPN list.
 ///
 /// `protocols` is the length-prefixed protocol list from the TLS ClientHello. HTTP/2
 /// is preferred over HTTP/1.1 regardless of the peer's order; `None` means the lists
-/// do not overlap.
+/// do not overlap or are too large to pass to the C parser.
 #[must_use]
 pub fn select_next_protocol(protocols: &[u8]) -> Option<AlpnProtocol> {
-    let Ok(inlen) = u32::try_from(protocols.len()) else {
-        return None;
-    };
+    let inlen = checked_alpn_len(protocols.len())?;
     let mut out: *mut c_uchar = core::ptr::null_mut();
     let mut outlen: c_uchar = 0;
-    // SAFETY: nghttp2_select_next_protocol bounds-checks the length-prefixed list
-    // before reading it. The two out-pointers are valid locals and are written only
-    // on success; the selected bytes point into `protocols`, which outlives the call.
+    // SAFETY: `checked_alpn_len` rejects lengths where the C loop's unsigned
+    // `i + keylen` arithmetic could wrap; below that limit the parser bounds-checks
+    // every read. The out-pointers are valid locals, written only on success, and
+    // the selected bytes point into `protocols`, which outlives the call.
     let selected = unsafe {
         nghttp2_sys::nghttp2_select_next_protocol(
             &raw mut out,
@@ -596,6 +621,7 @@ mod tests {
         let unknown = ErrorCode::from_raw(999);
         assert_eq!(unknown.message(), "unknown");
         assert_eq!(unknown.raw(), 999);
+        assert_eq!(unknown.to_string(), "UNKNOWN(0x000003e7)");
         assert_eq!(ErrorCode::from(8), ErrorCode::CANCEL);
         assert_eq!(u32::from(ErrorCode::CANCEL), 8);
     }
@@ -648,6 +674,9 @@ mod tests {
         assert!(flags.contains(FrameFlags::END_HEADERS));
         assert!(!flags.contains(FrameFlags::PADDED));
         assert!(flags.contains(FrameFlags::NONE));
+        // Partial overlap is not containment.
+        assert!(!FrameFlags::from_bits(0x04).contains(FrameFlags::from_bits(0x05)));
+        assert!(FrameFlags::from_bits(0x05).contains(FrameFlags::from_bits(0x05)));
         assert_eq!(flags.bits(), 0x5);
         assert_eq!((!FrameFlags::NONE).bits(), 0xff);
         assert_eq!(
@@ -656,6 +685,41 @@ mod tests {
         );
         assert_eq!(u8::from(flags), 0x5);
         assert_eq!(FrameFlags::from(0x5), flags);
+
+        let mut assigned = FrameFlags::NONE;
+        assigned |= FrameFlags::END_STREAM;
+        assigned |= FrameFlags::END_HEADERS;
+        assert_eq!(assigned.bits(), 0x5);
+        assigned &= FrameFlags::END_HEADERS;
+        assert_eq!(assigned.bits(), 0x4);
+    }
+
+    #[test]
+    fn unknown_raw_values_round_trip_through_the_newtypes() {
+        assert_eq!(ErrorCode::from_raw(u32::MAX).raw(), u32::MAX);
+        assert_eq!(SettingsId::from_raw(0xdead).raw(), 0xdead);
+        assert_eq!(FrameType::from_raw(0xfe).raw(), 0xfe);
+        assert_eq!(StreamProtoState::from_raw(0xffff).raw(), 0xffff);
+        assert_eq!(HeadersCategory::from_raw(0xffff).raw(), 0xffff);
+    }
+
+    #[test]
+    fn alpn_skips_zero_length_entries() {
+        // The zero-length entry is malformed but the C walk skips it safely.
+        assert_eq!(
+            select_next_protocol(&[0, 2, b'h', b'2']),
+            Some(AlpnProtocol::Http2)
+        );
+    }
+
+    #[test]
+    fn error_code_unknown_display_keeps_the_raw_value() {
+        assert_eq!(ErrorCode::from_raw(14).to_string(), "UNKNOWN(0x0000000e)");
+        assert_eq!(ErrorCode::from_raw(255).to_string(), "UNKNOWN(0x000000ff)");
+        assert_eq!(
+            ErrorCode::from_raw(u32::MAX).to_string(),
+            "UNKNOWN(0xffffffff)"
+        );
     }
 
     #[test]
@@ -669,6 +733,9 @@ mod tests {
         assert_eq!(StreamProtoState::CLOSED.raw(), 7);
         assert!(StreamProtoState::CLOSED.is_closed());
         assert!(!StreamProtoState::OPEN.is_closed());
+        // Unknown values must not be treated as closed by a `>=` implementation.
+        assert!(!StreamProtoState::from_raw(0).is_closed());
+        assert!(!StreamProtoState::from_raw(8).is_closed());
         assert_eq!(StreamProtoState::OPEN.to_string(), "open");
         assert_eq!(
             StreamProtoState::from_raw(0).to_string(),
@@ -682,7 +749,7 @@ mod tests {
         assert_eq!(HeadersCategory::RESPONSE.raw(), 1);
         assert_eq!(HeadersCategory::PUSH_RESPONSE.raw(), 2);
         assert_eq!(HeadersCategory::HEADERS.raw(), 3);
-        assert_eq!(HeadersCategory::HEADERS.to_string(), "trailers");
+        assert_eq!(HeadersCategory::HEADERS.to_string(), "HEADERS");
         assert_eq!(
             HeadersCategory::from_raw(9).to_string(),
             "UNKNOWN(0x00000009)"
@@ -717,6 +784,8 @@ mod tests {
 
     #[test]
     fn alpn_reports_no_overlap_and_ignores_malformed_lists() {
+        assert_eq!(checked_alpn_len(MAX_ALPN_LIST_LEN), Some(u32::MAX - 256));
+        assert_eq!(checked_alpn_len(MAX_ALPN_LIST_LEN + 1), None);
         assert_eq!(select_next_protocol(&[]), None);
         // A length prefix that cannot fit the remaining bytes.
         assert_eq!(select_next_protocol(&[250, b'h']), None);

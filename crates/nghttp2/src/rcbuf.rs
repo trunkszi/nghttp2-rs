@@ -1,9 +1,10 @@
 //! Reference-counted byte buffers owned by `nghttp2`.
 //!
 //! A received header name or value can point into an `nghttp2_rcbuf`. The C library
-//! owns one reference for the duration of the callback that delivers it and releases
-//! that reference when the callback returns, so a caller that keeps the bytes must
-//! take a reference of its own and release it when the buffer is no longer needed.
+//! keeps the buffer alive at least for the duration of the callback that delivers
+//! it, and may retain it until the header block ends; a caller that keeps the bytes
+//! must take a reference of its own and release it when the buffer is no longer
+//! needed.
 //!
 //! [`RcBuf`] is that reference: [`RcBuf::from_raw`] increments the count,
 //! [`RcBuf::as_slice`] borrows the bytes, and the [`Drop`] implementation decrements
@@ -50,6 +51,10 @@ impl RcBuf {
     /// pass the same acquisition to `nghttp2_rcbuf_decref`. A reference the library
     /// itself holds, including the one it keeps for the duration of a callback,
     /// remains the library's to release.
+    ///
+    /// The native reference count is not atomic, so the caller must also ensure that
+    /// no other thread increments or decrements this buffer while this call or the
+    /// returned wrapper uses it.
     pub unsafe fn from_raw(raw: *mut RawRcBuf) -> Option<Self> {
         let raw = core::ptr::NonNull::new(raw)?;
         // SAFETY: `NonNull::new` rejected the null pointer, and the caller
@@ -119,7 +124,59 @@ impl core::fmt::Debug for RcBuf {
 
 #[cfg(test)]
 mod tests {
+    use core::ffi::{c_int, c_void};
+
     use super::*;
+
+    // `libnghttp2` exports these helpers, but they live in private headers
+    // (lib/nghttp2_rcbuf.h and lib/nghttp2_mem.h), so they are not part of the
+    // public bindings. The tests use them to create real buffers without a session.
+    unsafe extern "C" {
+        fn nghttp2_mem_default() -> *mut nghttp2_sys::nghttp2_mem;
+        fn nghttp2_rcbuf_new(
+            rcbuf_ptr: *mut *mut RawRcBuf,
+            size: usize,
+            mem: *mut nghttp2_sys::nghttp2_mem,
+        ) -> c_int;
+        fn nghttp2_rcbuf_new2(
+            rcbuf_ptr: *mut *mut RawRcBuf,
+            src: *const u8,
+            srclen: usize,
+            mem: *mut nghttp2_sys::nghttp2_mem,
+        ) -> c_int;
+    }
+
+    /// Test-only mirror of the private `struct nghttp2_rcbuf`. The layout is
+    /// identical in the vendored master and v1.70.0 sources.
+    #[repr(C)]
+    struct RcBufLayout {
+        _mem_user_data: *mut c_void,
+        _free: *mut c_void,
+        _base: *mut u8,
+        _len: usize,
+        ref_count: i32,
+    }
+
+    const _: () = assert!(core::mem::size_of::<RcBufLayout>() == 40);
+    const _: () = assert!(core::mem::offset_of!(RcBufLayout, ref_count) == 32);
+
+    fn ref_count(raw: *mut RawRcBuf) -> i32 {
+        // SAFETY: the caller passes a live buffer and `RcBufLayout` mirrors the C
+        // layout used by the linked library.
+        unsafe { (*raw.cast::<RcBufLayout>()).ref_count }
+    }
+
+    unsafe fn new_buffer(src: &[u8]) -> *mut RawRcBuf {
+        let mut raw = core::ptr::null_mut();
+        // SAFETY: `nghttp2_mem_default` returns a static allocator; `new2` copies
+        // `src` into a buffer whose reference count starts at one.
+        let result = unsafe {
+            nghttp2_rcbuf_new2(&raw mut raw, src.as_ptr(), src.len(), nghttp2_mem_default())
+        };
+        assert_eq!(result, 0, "nghttp2_rcbuf_new2 failed");
+        assert!(!raw.is_null());
+        raw
+    }
 
     #[test]
     fn null_pointer_yields_none() {
@@ -130,11 +187,80 @@ mod tests {
     }
 
     #[test]
+    fn live_buffer_exposes_bytes_and_balances_references() {
+        // SAFETY: `new_buffer` returns a live buffer with one reference, which this
+        // test releases explicitly at the end.
+        let raw = unsafe { new_buffer(b"hello") };
+        assert_eq!(ref_count(raw), 1);
+
+        // SAFETY: `raw` is live and owned by this test.
+        let buffer = unsafe { RcBuf::from_raw(raw) }.expect("non-null buffer");
+        assert_eq!(ref_count(raw), 2);
+        assert_eq!(buffer.as_slice(), b"hello");
+        assert_eq!(buffer.as_ref(), b"hello");
+        assert!(!buffer.is_static());
+
+        let clone = buffer.clone();
+        assert_eq!(ref_count(raw), 3);
+        drop(clone);
+        assert_eq!(ref_count(raw), 2);
+        assert_eq!(buffer.as_slice(), b"hello");
+
+        drop(buffer);
+        assert_eq!(ref_count(raw), 1);
+        // SAFETY: this releases the reference returned by `nghttp2_rcbuf_new2`.
+        unsafe { nghttp2_sys::nghttp2_rcbuf_decref(raw) };
+    }
+
+    #[test]
+    fn zero_length_buffer_is_empty_and_debuggable() {
+        let mut raw = core::ptr::null_mut();
+        // SAFETY: `nghttp2_mem_default` returns a static allocator; `new` allocates
+        // a buffer whose reference count starts at one.
+        let result = unsafe { nghttp2_rcbuf_new(&raw mut raw, 0, nghttp2_mem_default()) };
+        assert_eq!(result, 0, "nghttp2_rcbuf_new failed");
+        assert!(!raw.is_null());
+
+        // SAFETY: `raw` is live and owned by this test.
+        let buffer = unsafe { RcBuf::from_raw(raw) }.expect("non-null buffer");
+        assert!(buffer.as_slice().is_empty());
+        assert_eq!(format!("{buffer:?}"), "RcBuf([])");
+        assert_eq!(ref_count(raw), 2);
+
+        drop(buffer);
+        assert_eq!(ref_count(raw), 1);
+        // SAFETY: this releases the reference returned by `nghttp2_rcbuf_new`.
+        unsafe { nghttp2_sys::nghttp2_rcbuf_decref(raw) };
+    }
+
+    #[test]
+    fn static_buffer_is_refcount_neutral() {
+        static NAME: &[u8] = b":method";
+        let mut raw = RcBufLayout {
+            _mem_user_data: core::ptr::null_mut(),
+            _free: core::ptr::null_mut(),
+            _base: NAME.as_ptr().cast_mut(),
+            _len: NAME.len(),
+            ref_count: -1,
+        };
+        // SAFETY: the stack object mirrors the private layout, and `ref == -1` marks
+        // a static buffer; both incref and decref return immediately for that value,
+        // so nghttp2 never frees the stack storage.
+        let buffer =
+            unsafe { RcBuf::from_raw((&raw mut raw).cast::<RawRcBuf>()) }.expect("non-null buffer");
+        assert!(buffer.is_static());
+        assert_eq!(buffer.as_slice(), NAME);
+
+        let clone = buffer.clone();
+        assert_eq!(raw.ref_count, -1);
+        drop(clone);
+        assert_eq!(raw.ref_count, -1);
+        drop(buffer);
+        assert_eq!(raw.ref_count, -1);
+    }
+
+    #[test]
     fn rc_buf_exposes_a_byte_slice() {
-        // Only the trait bound is checked here. A live `RcBuf` can be created solely
-        // from a buffer delivered to a session callback, and faking an nghttp2-owned
-        // object would violate the `from_raw` contract; the integration suite
-        // exercises real buffers instead.
         fn assert_as_ref<T: AsRef<[u8]>>() {}
         assert_as_ref::<RcBuf>();
     }
