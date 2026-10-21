@@ -1,0 +1,700 @@
+unsafe extern "C" {
+    pub fn nghttp2_session_callbacks_set_data_source_read_length_callback2(
+        cbs: *mut nghttp2_session_callbacks,
+        data_source_read_length_callback: nghttp2_data_source_read_length_callback2,
+    );
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_callbacks_set_on_begin_frame_callback(
+        cbs: *mut nghttp2_session_callbacks,
+        on_begin_frame_callback: nghttp2_on_begin_frame_callback,
+    );
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_callbacks_set_send_data_callback(
+        cbs: *mut nghttp2_session_callbacks,
+        send_data_callback: nghttp2_send_data_callback,
+    );
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_callbacks_set_pack_extension_callback(
+        cbs: *mut nghttp2_session_callbacks,
+        pack_extension_callback: nghttp2_pack_extension_callback,
+    );
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_callbacks_set_pack_extension_callback2(
+        cbs: *mut nghttp2_session_callbacks,
+        pack_extension_callback: nghttp2_pack_extension_callback2,
+    );
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_callbacks_set_unpack_extension_callback(
+        cbs: *mut nghttp2_session_callbacks,
+        unpack_extension_callback: nghttp2_unpack_extension_callback,
+    );
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_callbacks_set_on_extension_chunk_recv_callback(
+        cbs: *mut nghttp2_session_callbacks,
+        on_extension_chunk_recv_callback: nghttp2_on_extension_chunk_recv_callback,
+    );
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_callbacks_set_error_callback(
+        cbs: *mut nghttp2_session_callbacks,
+        error_callback: nghttp2_error_callback,
+    );
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_callbacks_set_error_callback2(
+        cbs: *mut nghttp2_session_callbacks,
+        error_callback2: nghttp2_error_callback2,
+    );
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_callbacks_set_rand_callback(
+        cbs: *mut nghttp2_session_callbacks,
+        rand_callback: nghttp2_rand_callback,
+    );
+}
+pub type nghttp2_malloc = ::std::option::Option<
+    unsafe extern "C" fn(
+        size: usize,
+        mem_user_data: *mut ::std::os::raw::c_void,
+    ) -> *mut ::std::os::raw::c_void,
+>;
+pub type nghttp2_free = ::std::option::Option<
+    unsafe extern "C" fn(
+        ptr: *mut ::std::os::raw::c_void,
+        mem_user_data: *mut ::std::os::raw::c_void,
+    ),
+>;
+pub type nghttp2_calloc = ::std::option::Option<
+    unsafe extern "C" fn(
+        nmemb: usize,
+        size: usize,
+        mem_user_data: *mut ::std::os::raw::c_void,
+    ) -> *mut ::std::os::raw::c_void,
+>;
+pub type nghttp2_realloc = ::std::option::Option<
+    unsafe extern "C" fn(
+        ptr: *mut ::std::os::raw::c_void,
+        size: usize,
+        mem_user_data: *mut ::std::os::raw::c_void,
+    ) -> *mut ::std::os::raw::c_void,
+>;
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct nghttp2_mem {
+    pub mem_user_data: *mut ::std::os::raw::c_void,
+    pub malloc: nghttp2_malloc,
+    pub free: nghttp2_free,
+    pub calloc: nghttp2_calloc,
+    pub realloc: nghttp2_realloc,
+}
+#[repr(C)]
+#[derive(Debug)]
+pub struct nghttp2_option {
+    _unused: [u8; 0],
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_new(option_ptr: *mut *mut nghttp2_option) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_del(option: *mut nghttp2_option);
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_set_no_auto_window_update(
+        option: *mut nghttp2_option,
+        val: ::std::os::raw::c_int,
+    );
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_set_peer_max_concurrent_streams(option: *mut nghttp2_option, val: u32);
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_set_no_recv_client_magic(
+        option: *mut nghttp2_option,
+        val: ::std::os::raw::c_int,
+    );
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_set_no_http_messaging(
+        option: *mut nghttp2_option,
+        val: ::std::os::raw::c_int,
+    );
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_set_max_reserved_remote_streams(option: *mut nghttp2_option, val: u32);
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_set_user_recv_extension_type(option: *mut nghttp2_option, type_: u8);
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_set_builtin_recv_extension_type(option: *mut nghttp2_option, type_: u8);
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_set_no_auto_ping_ack(
+        option: *mut nghttp2_option,
+        val: ::std::os::raw::c_int,
+    );
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_set_max_send_header_block_length(option: *mut nghttp2_option, val: usize);
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_set_max_deflate_dynamic_table_size(
+        option: *mut nghttp2_option,
+        val: usize,
+    );
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_set_no_closed_streams(
+        option: *mut nghttp2_option,
+        val: ::std::os::raw::c_int,
+    );
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_set_max_outbound_ack(option: *mut nghttp2_option, val: usize);
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_set_max_settings(option: *mut nghttp2_option, val: usize);
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_set_server_fallback_rfc7540_priorities(
+        option: *mut nghttp2_option,
+        val: ::std::os::raw::c_int,
+    );
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_set_no_rfc9113_leading_and_trailing_ws_validation(
+        option: *mut nghttp2_option,
+        val: ::std::os::raw::c_int,
+    );
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_set_stream_reset_rate_limit(
+        option: *mut nghttp2_option,
+        burst: u64,
+        rate: u64,
+    );
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_set_max_continuations(option: *mut nghttp2_option, val: usize);
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_set_glitch_rate_limit(option: *mut nghttp2_option, burst: u64, rate: u64);
+}
+unsafe extern "C" {
+    pub fn nghttp2_option_set_max_outbound_queue_size(option: *mut nghttp2_option, val: usize);
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_client_new(
+        session_ptr: *mut *mut nghttp2_session,
+        callbacks: *const nghttp2_session_callbacks,
+        user_data: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_server_new(
+        session_ptr: *mut *mut nghttp2_session,
+        callbacks: *const nghttp2_session_callbacks,
+        user_data: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_client_new2(
+        session_ptr: *mut *mut nghttp2_session,
+        callbacks: *const nghttp2_session_callbacks,
+        user_data: *mut ::std::os::raw::c_void,
+        option: *const nghttp2_option,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_server_new2(
+        session_ptr: *mut *mut nghttp2_session,
+        callbacks: *const nghttp2_session_callbacks,
+        user_data: *mut ::std::os::raw::c_void,
+        option: *const nghttp2_option,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_client_new3(
+        session_ptr: *mut *mut nghttp2_session,
+        callbacks: *const nghttp2_session_callbacks,
+        user_data: *mut ::std::os::raw::c_void,
+        option: *const nghttp2_option,
+        mem: *mut nghttp2_mem,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_server_new3(
+        session_ptr: *mut *mut nghttp2_session,
+        callbacks: *const nghttp2_session_callbacks,
+        user_data: *mut ::std::os::raw::c_void,
+        option: *const nghttp2_option,
+        mem: *mut nghttp2_mem,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_del(session: *mut nghttp2_session);
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_send(session: *mut nghttp2_session) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_mem_send(
+        session: *mut nghttp2_session,
+        data_ptr: *mut *const u8,
+    ) -> isize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_mem_send2(
+        session: *mut nghttp2_session,
+        data_ptr: *mut *const u8,
+    ) -> nghttp2_ssize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_recv(session: *mut nghttp2_session) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_mem_recv(
+        session: *mut nghttp2_session,
+        in_: *const u8,
+        inlen: usize,
+    ) -> isize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_mem_recv2(
+        session: *mut nghttp2_session,
+        in_: *const u8,
+        inlen: usize,
+    ) -> nghttp2_ssize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_resume_data(
+        session: *mut nghttp2_session,
+        stream_id: i32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_want_read(session: *mut nghttp2_session) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_want_write(session: *mut nghttp2_session) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_get_stream_user_data(
+        session: *mut nghttp2_session,
+        stream_id: i32,
+    ) -> *mut ::std::os::raw::c_void;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_set_stream_user_data(
+        session: *mut nghttp2_session,
+        stream_id: i32,
+        stream_user_data: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_set_user_data(
+        session: *mut nghttp2_session,
+        user_data: *mut ::std::os::raw::c_void,
+    );
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_get_outbound_queue_size(session: *mut nghttp2_session) -> usize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_get_stream_effective_recv_data_length(
+        session: *mut nghttp2_session,
+        stream_id: i32,
+    ) -> i32;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_get_stream_effective_local_window_size(
+        session: *mut nghttp2_session,
+        stream_id: i32,
+    ) -> i32;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_get_stream_local_window_size(
+        session: *mut nghttp2_session,
+        stream_id: i32,
+    ) -> i32;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_get_effective_recv_data_length(session: *mut nghttp2_session) -> i32;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_get_effective_local_window_size(session: *mut nghttp2_session) -> i32;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_get_local_window_size(session: *mut nghttp2_session) -> i32;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_get_stream_remote_window_size(
+        session: *mut nghttp2_session,
+        stream_id: i32,
+    ) -> i32;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_get_remote_window_size(session: *mut nghttp2_session) -> i32;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_get_stream_local_close(
+        session: *mut nghttp2_session,
+        stream_id: i32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_get_stream_remote_close(
+        session: *mut nghttp2_session,
+        stream_id: i32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_get_hd_inflate_dynamic_table_size(
+        session: *mut nghttp2_session,
+    ) -> usize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_get_hd_deflate_dynamic_table_size(
+        session: *mut nghttp2_session,
+    ) -> usize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_terminate_session(
+        session: *mut nghttp2_session,
+        error_code: u32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_terminate_session2(
+        session: *mut nghttp2_session,
+        last_stream_id: i32,
+        error_code: u32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_submit_shutdown_notice(session: *mut nghttp2_session) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_get_remote_settings(
+        session: *mut nghttp2_session,
+        id: nghttp2_settings_id,
+    ) -> u32;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_get_local_settings(
+        session: *mut nghttp2_session,
+        id: nghttp2_settings_id,
+    ) -> u32;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_set_next_stream_id(
+        session: *mut nghttp2_session,
+        next_stream_id: i32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_get_next_stream_id(session: *mut nghttp2_session) -> u32;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_consume(
+        session: *mut nghttp2_session,
+        stream_id: i32,
+        size: usize,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_consume_connection(
+        session: *mut nghttp2_session,
+        size: usize,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_consume_stream(
+        session: *mut nghttp2_session,
+        stream_id: i32,
+        size: usize,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_change_stream_priority(
+        session: *mut nghttp2_session,
+        stream_id: i32,
+        pri_spec: *const nghttp2_priority_spec,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_create_idle_stream(
+        session: *mut nghttp2_session,
+        stream_id: i32,
+        pri_spec: *const nghttp2_priority_spec,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_upgrade(
+        session: *mut nghttp2_session,
+        settings_payload: *const u8,
+        settings_payloadlen: usize,
+        stream_user_data: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_upgrade2(
+        session: *mut nghttp2_session,
+        settings_payload: *const u8,
+        settings_payloadlen: usize,
+        head_request: ::std::os::raw::c_int,
+        stream_user_data: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_pack_settings_payload(
+        buf: *mut u8,
+        buflen: usize,
+        iv: *const nghttp2_settings_entry,
+        niv: usize,
+    ) -> isize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_pack_settings_payload2(
+        buf: *mut u8,
+        buflen: usize,
+        iv: *const nghttp2_settings_entry,
+        niv: usize,
+    ) -> nghttp2_ssize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_strerror(lib_error_code: ::std::os::raw::c_int)
+        -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn nghttp2_http2_strerror(error_code: u32) -> *const ::std::os::raw::c_char;
+}
+unsafe extern "C" {
+    pub fn nghttp2_priority_spec_init(
+        pri_spec: *mut nghttp2_priority_spec,
+        stream_id: i32,
+        weight: i32,
+        exclusive: ::std::os::raw::c_int,
+    );
+}
+unsafe extern "C" {
+    pub fn nghttp2_priority_spec_default_init(pri_spec: *mut nghttp2_priority_spec);
+}
+unsafe extern "C" {
+    pub fn nghttp2_priority_spec_check_default(
+        pri_spec: *const nghttp2_priority_spec,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_submit_request(
+        session: *mut nghttp2_session,
+        pri_spec: *const nghttp2_priority_spec,
+        nva: *const nghttp2_nv,
+        nvlen: usize,
+        data_prd: *const nghttp2_data_provider,
+        stream_user_data: *mut ::std::os::raw::c_void,
+    ) -> i32;
+}
+unsafe extern "C" {
+    pub fn nghttp2_submit_request2(
+        session: *mut nghttp2_session,
+        pri_spec: *const nghttp2_priority_spec,
+        nva: *const nghttp2_nv,
+        nvlen: usize,
+        data_prd: *const nghttp2_data_provider2,
+        stream_user_data: *mut ::std::os::raw::c_void,
+    ) -> i32;
+}
+unsafe extern "C" {
+    pub fn nghttp2_submit_response(
+        session: *mut nghttp2_session,
+        stream_id: i32,
+        nva: *const nghttp2_nv,
+        nvlen: usize,
+        data_prd: *const nghttp2_data_provider,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_submit_response2(
+        session: *mut nghttp2_session,
+        stream_id: i32,
+        nva: *const nghttp2_nv,
+        nvlen: usize,
+        data_prd: *const nghttp2_data_provider2,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_submit_trailer(
+        session: *mut nghttp2_session,
+        stream_id: i32,
+        nva: *const nghttp2_nv,
+        nvlen: usize,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_submit_headers(
+        session: *mut nghttp2_session,
+        flags: u8,
+        stream_id: i32,
+        pri_spec: *const nghttp2_priority_spec,
+        nva: *const nghttp2_nv,
+        nvlen: usize,
+        stream_user_data: *mut ::std::os::raw::c_void,
+    ) -> i32;
+}
+unsafe extern "C" {
+    pub fn nghttp2_submit_data(
+        session: *mut nghttp2_session,
+        flags: u8,
+        stream_id: i32,
+        data_prd: *const nghttp2_data_provider,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_submit_data2(
+        session: *mut nghttp2_session,
+        flags: u8,
+        stream_id: i32,
+        data_prd: *const nghttp2_data_provider2,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_submit_priority(
+        session: *mut nghttp2_session,
+        flags: u8,
+        stream_id: i32,
+        pri_spec: *const nghttp2_priority_spec,
+    ) -> ::std::os::raw::c_int;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct nghttp2_extpri {
+    pub urgency: u32,
+    pub inc: ::std::os::raw::c_int,
+}
+unsafe extern "C" {
+    pub fn nghttp2_submit_rst_stream(
+        session: *mut nghttp2_session,
+        flags: u8,
+        stream_id: i32,
+        error_code: u32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_submit_settings(
+        session: *mut nghttp2_session,
+        flags: u8,
+        iv: *const nghttp2_settings_entry,
+        niv: usize,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_submit_push_promise(
+        session: *mut nghttp2_session,
+        flags: u8,
+        stream_id: i32,
+        nva: *const nghttp2_nv,
+        nvlen: usize,
+        promised_stream_user_data: *mut ::std::os::raw::c_void,
+    ) -> i32;
+}
+unsafe extern "C" {
+    pub fn nghttp2_submit_ping(
+        session: *mut nghttp2_session,
+        flags: u8,
+        opaque_data: *const u8,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_submit_goaway(
+        session: *mut nghttp2_session,
+        flags: u8,
+        last_stream_id: i32,
+        error_code: u32,
+        opaque_data: *const u8,
+        opaque_data_len: usize,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_get_last_proc_stream_id(session: *mut nghttp2_session) -> i32;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_check_request_allowed(
+        session: *mut nghttp2_session,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_check_server_session(
+        session: *mut nghttp2_session,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_submit_window_update(
+        session: *mut nghttp2_session,
+        flags: u8,
+        stream_id: i32,
+        window_size_increment: i32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_set_local_window_size(
+        session: *mut nghttp2_session,
+        flags: u8,
+        stream_id: i32,
+        window_size: i32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_submit_extension(
+        session: *mut nghttp2_session,
+        type_: u8,
+        flags: u8,
+        stream_id: i32,
+        payload: *mut ::std::os::raw::c_void,
+    ) -> ::std::os::raw::c_int;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct nghttp2_ext_altsvc {
+    pub origin: *mut u8,
+    pub origin_len: usize,
+    pub field_value: *mut u8,
+    pub field_value_len: usize,
+}
+unsafe extern "C" {
+    pub fn nghttp2_submit_altsvc(
+        session: *mut nghttp2_session,
+        flags: u8,
+        stream_id: i32,
+        origin: *const u8,
+        origin_len: usize,
+        field_value: *const u8,
+        field_value_len: usize,
+    ) -> ::std::os::raw::c_int;
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct nghttp2_origin_entry {
+    pub origin: *mut u8,
+    pub origin_len: usize,
+}
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct nghttp2_ext_origin {
+    pub nov: usize,
+    pub ov: *mut nghttp2_origin_entry,
+}
+unsafe extern "C" {
+    pub fn nghttp2_submit_origin(
+        session: *mut nghttp2_session,
+        flags: u8,
+        ov: *const nghttp2_origin_entry,
+        nov: usize,
+    ) -> ::std::os::raw::c_int;
+}

@@ -1,0 +1,7 @@
+// Declarations that `rust-bindgen` cannot evaluate because the upstream macros use
+// `sizeof` or casts, plus public type aliases that would otherwise be dropped.
+//
+// Values mirror the upstream header for the 32/64-bit Linux ABI.
+
+pub const NGHTTP2_PROTO_ALPN_LEN: u32 = 3;
+pub const NGHTTP2_MAX_WINDOW_SIZE: i32 = 2_147_483_647;

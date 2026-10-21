@@ -1,0 +1,301 @@
+#[repr(C)]
+#[derive(Debug, Copy, Clone)]
+pub struct nghttp2_ext_priority_update {
+    pub stream_id: i32,
+    pub field_value: *mut u8,
+    pub field_value_len: usize,
+}
+unsafe extern "C" {
+    pub fn nghttp2_submit_priority_update(
+        session: *mut nghttp2_session,
+        flags: u8,
+        stream_id: i32,
+        field_value: *const u8,
+        field_value_len: usize,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_change_extpri_stream_priority(
+        session: *mut nghttp2_session,
+        stream_id: i32,
+        extpri: *const nghttp2_extpri,
+        ignore_client_signal: ::std::os::raw::c_int,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_get_extpri_stream_priority(
+        session: *mut nghttp2_session,
+        extpri: *mut nghttp2_extpri,
+        stream_id: i32,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_extpri_parse_priority(
+        extpri: *mut nghttp2_extpri,
+        value: *const u8,
+        len: usize,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_nv_compare_name(
+        lhs: *const nghttp2_nv,
+        rhs: *const nghttp2_nv,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_select_next_protocol(
+        out: *mut *mut ::std::os::raw::c_uchar,
+        outlen: *mut ::std::os::raw::c_uchar,
+        in_: *const ::std::os::raw::c_uchar,
+        inlen: ::std::os::raw::c_uint,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_select_alpn(
+        out: *mut *const ::std::os::raw::c_uchar,
+        outlen: *mut ::std::os::raw::c_uchar,
+        in_: *const ::std::os::raw::c_uchar,
+        inlen: ::std::os::raw::c_uint,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_version(least_version: ::std::os::raw::c_int) -> *mut nghttp2_info;
+}
+unsafe extern "C" {
+    pub fn nghttp2_is_fatal(lib_error_code: ::std::os::raw::c_int) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_check_header_name(name: *const u8, len: usize) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_check_header_value(value: *const u8, len: usize) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_check_header_value_rfc9113(
+        value: *const u8,
+        len: usize,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_check_method(value: *const u8, len: usize) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_check_path(value: *const u8, len: usize) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_check_authority(value: *const u8, len: usize) -> ::std::os::raw::c_int;
+}
+#[repr(C)]
+#[derive(Debug)]
+pub struct nghttp2_hd_deflater {
+    _unused: [u8; 0],
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_deflate_new(
+        deflater_ptr: *mut *mut nghttp2_hd_deflater,
+        max_deflate_dynamic_table_size: usize,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_deflate_new2(
+        deflater_ptr: *mut *mut nghttp2_hd_deflater,
+        max_deflate_dynamic_table_size: usize,
+        mem: *mut nghttp2_mem,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_deflate_del(deflater: *mut nghttp2_hd_deflater);
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_deflate_change_table_size(
+        deflater: *mut nghttp2_hd_deflater,
+        settings_max_dynamic_table_size: usize,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_deflate_hd(
+        deflater: *mut nghttp2_hd_deflater,
+        buf: *mut u8,
+        buflen: usize,
+        nva: *const nghttp2_nv,
+        nvlen: usize,
+    ) -> isize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_deflate_hd2(
+        deflater: *mut nghttp2_hd_deflater,
+        buf: *mut u8,
+        buflen: usize,
+        nva: *const nghttp2_nv,
+        nvlen: usize,
+    ) -> nghttp2_ssize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_deflate_hd_vec(
+        deflater: *mut nghttp2_hd_deflater,
+        vec: *const nghttp2_vec,
+        veclen: usize,
+        nva: *const nghttp2_nv,
+        nvlen: usize,
+    ) -> isize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_deflate_hd_vec2(
+        deflater: *mut nghttp2_hd_deflater,
+        vec: *const nghttp2_vec,
+        veclen: usize,
+        nva: *const nghttp2_nv,
+        nvlen: usize,
+    ) -> nghttp2_ssize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_deflate_bound(
+        deflater: *mut nghttp2_hd_deflater,
+        nva: *const nghttp2_nv,
+        nvlen: usize,
+    ) -> usize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_deflate_get_num_table_entries(deflater: *mut nghttp2_hd_deflater) -> usize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_deflate_get_table_entry(
+        deflater: *mut nghttp2_hd_deflater,
+        idx: usize,
+    ) -> *const nghttp2_nv;
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_deflate_get_dynamic_table_size(deflater: *mut nghttp2_hd_deflater) -> usize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_deflate_get_max_dynamic_table_size(
+        deflater: *mut nghttp2_hd_deflater,
+    ) -> usize;
+}
+#[repr(C)]
+#[derive(Debug)]
+pub struct nghttp2_hd_inflater {
+    _unused: [u8; 0],
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_inflate_new(
+        inflater_ptr: *mut *mut nghttp2_hd_inflater,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_inflate_new2(
+        inflater_ptr: *mut *mut nghttp2_hd_inflater,
+        mem: *mut nghttp2_mem,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_inflate_del(inflater: *mut nghttp2_hd_inflater);
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_inflate_change_table_size(
+        inflater: *mut nghttp2_hd_inflater,
+        settings_max_dynamic_table_size: usize,
+    ) -> ::std::os::raw::c_int;
+}
+pub const NGHTTP2_HD_INFLATE_NONE: nghttp2_hd_inflate_flag = 0;
+pub const NGHTTP2_HD_INFLATE_FINAL: nghttp2_hd_inflate_flag = 1;
+pub const NGHTTP2_HD_INFLATE_EMIT: nghttp2_hd_inflate_flag = 2;
+pub type nghttp2_hd_inflate_flag = ::std::os::raw::c_uint;
+unsafe extern "C" {
+    pub fn nghttp2_hd_inflate_hd(
+        inflater: *mut nghttp2_hd_inflater,
+        nv_out: *mut nghttp2_nv,
+        inflate_flags: *mut ::std::os::raw::c_int,
+        in_: *mut u8,
+        inlen: usize,
+        in_final: ::std::os::raw::c_int,
+    ) -> isize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_inflate_hd2(
+        inflater: *mut nghttp2_hd_inflater,
+        nv_out: *mut nghttp2_nv,
+        inflate_flags: *mut ::std::os::raw::c_int,
+        in_: *const u8,
+        inlen: usize,
+        in_final: ::std::os::raw::c_int,
+    ) -> isize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_inflate_hd3(
+        inflater: *mut nghttp2_hd_inflater,
+        nv_out: *mut nghttp2_nv,
+        inflate_flags: *mut ::std::os::raw::c_int,
+        in_: *const u8,
+        inlen: usize,
+        in_final: ::std::os::raw::c_int,
+    ) -> nghttp2_ssize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_inflate_end_headers(
+        inflater: *mut nghttp2_hd_inflater,
+    ) -> ::std::os::raw::c_int;
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_inflate_get_num_table_entries(inflater: *mut nghttp2_hd_inflater) -> usize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_inflate_get_table_entry(
+        inflater: *mut nghttp2_hd_inflater,
+        idx: usize,
+    ) -> *const nghttp2_nv;
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_inflate_get_dynamic_table_size(inflater: *mut nghttp2_hd_inflater) -> usize;
+}
+unsafe extern "C" {
+    pub fn nghttp2_hd_inflate_get_max_dynamic_table_size(
+        inflater: *mut nghttp2_hd_inflater,
+    ) -> usize;
+}
+#[repr(C)]
+#[derive(Debug)]
+pub struct nghttp2_stream {
+    _unused: [u8; 0],
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_find_stream(
+        session: *mut nghttp2_session,
+        stream_id: i32,
+    ) -> *mut nghttp2_stream;
+}
+pub const NGHTTP2_STREAM_STATE_IDLE: nghttp2_stream_proto_state = 1;
+pub const NGHTTP2_STREAM_STATE_OPEN: nghttp2_stream_proto_state = 2;
+pub const NGHTTP2_STREAM_STATE_RESERVED_LOCAL: nghttp2_stream_proto_state = 3;
+pub const NGHTTP2_STREAM_STATE_RESERVED_REMOTE: nghttp2_stream_proto_state = 4;
+pub const NGHTTP2_STREAM_STATE_HALF_CLOSED_LOCAL: nghttp2_stream_proto_state = 5;
+pub const NGHTTP2_STREAM_STATE_HALF_CLOSED_REMOTE: nghttp2_stream_proto_state = 6;
+pub const NGHTTP2_STREAM_STATE_CLOSED: nghttp2_stream_proto_state = 7;
+pub type nghttp2_stream_proto_state = ::std::os::raw::c_uint;
+unsafe extern "C" {
+    pub fn nghttp2_stream_get_state(stream: *mut nghttp2_stream) -> nghttp2_stream_proto_state;
+}
+unsafe extern "C" {
+    pub fn nghttp2_session_get_root_stream(session: *mut nghttp2_session) -> *mut nghttp2_stream;
+}
+unsafe extern "C" {
+    pub fn nghttp2_stream_get_parent(stream: *mut nghttp2_stream) -> *mut nghttp2_stream;
+}
+unsafe extern "C" {
+    pub fn nghttp2_stream_get_stream_id(stream: *mut nghttp2_stream) -> i32;
+}
+unsafe extern "C" {
+    pub fn nghttp2_stream_get_next_sibling(stream: *mut nghttp2_stream) -> *mut nghttp2_stream;
+}
+unsafe extern "C" {
+    pub fn nghttp2_stream_get_previous_sibling(stream: *mut nghttp2_stream) -> *mut nghttp2_stream;
+}
+unsafe extern "C" {
+    pub fn nghttp2_stream_get_first_child(stream: *mut nghttp2_stream) -> *mut nghttp2_stream;
+}
+unsafe extern "C" {
+    pub fn nghttp2_stream_get_weight(stream: *mut nghttp2_stream) -> i32;
+}
+unsafe extern "C" {
+    pub fn nghttp2_stream_get_sum_dependency_weight(stream: *mut nghttp2_stream) -> i32;
+}

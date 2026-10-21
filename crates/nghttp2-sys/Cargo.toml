@@ -1,0 +1,25 @@
+[package]
+name = "nghttp2-sys"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Static CMake build and complete FFI declarations for upstream nghttp2"
+links = "nghttp2"
+
+[lib]
+# Upstream doc comments contain indented C examples that rustdoc would run as
+# Rust doctests.
+doctest = false
+
+[features]
+default = ["pre-release"]
+pre-release = []
+stable = []
+
+[build-dependencies]
+cmake = { workspace = true }
+
+[lints]
+workspace = true
