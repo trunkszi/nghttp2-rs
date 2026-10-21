@@ -45,9 +45,17 @@ pub const DEFERRED: i32 = nghttp2_sys::NGHTTP2_ERR_DEFERRED;
 pub enum DataPoll<'a> {
     /// Copy these bytes into the library's frame buffer; excess is served next poll.
     Copy(&'a [u8]),
+    /// Copy a final chunk, marking EOF on its last byte even when split across frames.
+    CopyEof(&'a [u8]),
+    /// Copy a final chunk and keep the stream open for trailing HEADERS.
+    CopyEofWithTrailers(&'a [u8]),
     /// Send these bytes through the session's `send_data` callback without copying; that callback
     /// must be installed and the bytes must stay valid and unmodified until sent.
     NoCopy(&'a [u8]),
+    /// Send a final NO_COPY chunk; the same transport/lifetime contract as `NoCopy` applies.
+    NoCopyEof(&'a [u8]),
+    /// Send a final NO_COPY chunk and keep the stream open for trailing HEADERS.
+    NoCopyEofWithTrailers(&'a [u8]),
     /// End of stream: no more bytes will follow.
     Eof,
     /// Finish this body while keeping the stream open for trailing HEADERS.
@@ -69,12 +77,13 @@ struct Pending {
     ptr: *const u8,
     len: usize,
     no_copy: bool,
+    end_flags: u32,
 }
 
 #[rustfmt::skip]
 impl Pending {
-    const EMPTY: Self = Self { ptr: ptr::null(), len: 0, no_copy: false };
-    fn new(ptr: *const u8, len: usize, no_copy: bool) -> Self { Self { ptr, len, no_copy } }
+    const EMPTY: Self = Self { ptr: ptr::null(), len: 0, no_copy: false, end_flags: 0 };
+    fn new(ptr: *const u8, len: usize, no_copy: bool, end_flags: u32) -> Self { Self { ptr, len, no_copy, end_flags } }
 }
 
 /// State behind [`DataProvider`]; boxed so its address never changes.
@@ -118,6 +127,8 @@ impl DataProvider {
     pub fn deferred() -> Self { Self::new(DeferredSource { waiting: true }) }
     /// Builds a provider that copies `data` into the library buffer.
     pub fn from_vec(data: Vec<u8>) -> Self { Self::new(VecSource { data, pos: 0, no_copy: false }) }
+    /// Copies a finite byte slice into an owned, EOF-aware provider.
+    pub fn bytes(data: &[u8]) -> Self { Self::from_vec(data.to_vec()) }
     /// Builds a provider that sends `data` through the session's `send_data` callback.
     pub fn from_vec_no_copy(data: Vec<u8>) -> Self { Self::new(VecSource { data, pos: 0, no_copy: true }) }
     /// Returns the descriptor nghttp2 copies into its queue; valid while `self` is alive, because `source.ptr` points into the stable heap state.
@@ -180,7 +191,7 @@ impl DataSource for VecSource {
         if self.pos >= self.data.len() { return DataPoll::Eof; }
         let chunk = &self.data[self.pos..];
         self.pos = self.data.len();
-        if self.no_copy { DataPoll::NoCopy(chunk) } else { DataPoll::Copy(chunk) }
+        if self.no_copy { DataPoll::NoCopyEof(chunk) } else { DataPoll::CopyEof(chunk) }
     }
 }
 
@@ -207,42 +218,43 @@ unsafe extern "C" fn provider_read(_session: *mut nghttp2_session, _stream_id: i
         // SAFETY: the source allocation is owned by this state. Pending chunks were
         // drained above, so no retained source borrow overlaps another read.
         let source = unsafe { state.source.as_mut() };
-        match source.read(len) {
-        DataPoll::Copy(chunk) => {
-            let take = chunk.len().min(len);
-            // SAFETY: `buf` is writable for `len` bytes and `chunk` holds `take`.
-            unsafe { ptr::copy_nonoverlapping(chunk.as_ptr(), buf, take) };
-            if take < chunk.len() {
-                // SAFETY: the source is not polled again until this remainder is drained.
-                let rest = unsafe { chunk.as_ptr().add(take) };
-                state.pending = Pending::new(rest, chunk.len() - take, false);
+        let (chunk, no_copy, end_flags) = match source.read(len) {
+            DataPoll::Copy(chunk) => (chunk, false, 0),
+            DataPoll::CopyEof(chunk) => (chunk, false, NGHTTP2_DATA_FLAG_EOF),
+            DataPoll::CopyEofWithTrailers(chunk) => (chunk, false, NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM),
+            DataPoll::NoCopy(chunk) => (chunk, true, 0),
+            DataPoll::NoCopyEof(chunk) => (chunk, true, NGHTTP2_DATA_FLAG_EOF),
+            DataPoll::NoCopyEofWithTrailers(chunk) => (chunk, true, NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM),
+            DataPoll::Eof => {
+                // SAFETY: flags is the writable native out-parameter.
+                unsafe { *flags |= NGHTTP2_DATA_FLAG_EOF };
+                return 0;
             }
-            take as nghttp2_ssize
-        }
-        DataPoll::NoCopy(chunk) => {
-            let take = chunk.len().min(len);
+            DataPoll::EofWithTrailers => {
+                // SAFETY: flags is the writable native out-parameter.
+                unsafe { *flags |= NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM };
+                return 0;
+            }
+            DataPoll::Deferred => return DEFERRED as nghttp2_ssize,
+        };
+        let take = chunk.len().min(len);
+        if no_copy && take != 0 {
             state.no_copy = Some((chunk.as_ptr(), take));
-            // SAFETY: `flags` is the writable out-parameter of this callback.
+            // SAFETY: flags is the writable native out-parameter.
             unsafe { *flags |= NGHTTP2_DATA_FLAG_NO_COPY };
-            if take < chunk.len() {
-                // SAFETY: same remainder rule as the `Copy` arm.
-                let rest = unsafe { chunk.as_ptr().add(take) };
-                state.pending = Pending::new(rest, chunk.len() - take, true);
-            }
-            take as nghttp2_ssize
+        } else {
+            // SAFETY: buf is writable for len bytes; chunk contains take readable bytes.
+            unsafe { ptr::copy_nonoverlapping(chunk.as_ptr(), buf, take) };
         }
-        DataPoll::Eof => {
-            // SAFETY: `flags` is the writable out-parameter of this callback.
-            unsafe { *flags |= NGHTTP2_DATA_FLAG_EOF };
-            0
+        if take < chunk.len() {
+            // SAFETY: the source is not polled again until this remainder is drained.
+            let rest = unsafe { chunk.as_ptr().add(take) };
+            state.pending = Pending::new(rest, chunk.len() - take, no_copy, end_flags);
+        } else {
+            // SAFETY: the entire final chunk has been consumed; flags is writable.
+            unsafe { *flags |= end_flags };
         }
-        DataPoll::EofWithTrailers => {
-            // SAFETY: `flags` is the writable out-parameter of this callback.
-            unsafe { *flags |= NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM };
-            0
-        }
-        DataPoll::Deferred => DEFERRED as nghttp2_ssize,
-        }
+        take as nghttp2_ssize
     }));
     match result {
         Ok(value) => value,
@@ -268,7 +280,11 @@ fn serve_pending(state: &mut ProviderState, buf: *mut u8, len: usize, flags: *mu
     // SAFETY: the consumed bytes lie inside the pending allocation.
     state.pending.ptr = unsafe { state.pending.ptr.add(take) };
     state.pending.len -= take;
-    if state.pending.len == 0 { state.pending.ptr = ptr::null(); }
+    if state.pending.len == 0 {
+        state.pending.ptr = ptr::null();
+        // SAFETY: this final split drains the terminal chunk; flags is writable.
+        unsafe { *flags |= state.pending.end_flags };
+    }
     take as isize
 }
 
@@ -548,123 +564,127 @@ impl SessionSubmit for SessionPtr<'_> {
 #[rustfmt::skip]
 impl SessionSubmit for SessionCtx<'_> {
     unsafe fn submit_request(&self, pri: Option<&PrioritySpec>, nva: &[HeaderField<'_>], data: Option<&mut DataProvider>, user_data: *mut c_void) -> Result<i32> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        // SAFETY: retained buffers and provider ownership follow the caller contract.
-        unsafe { handle.submit_request(pri, nva, data, user_data) }
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            // SAFETY: caller retains buffers/providers according to the trait contract.
+            unsafe { handle.submit_request(pri, nva, data, user_data) }
+        })
     }
     unsafe fn submit_response(&self, stream_id: i32, nva: &[HeaderField<'_>], data: Option<&mut DataProvider>) -> Result<()> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        // SAFETY: retained buffers and provider ownership follow the caller contract.
-        unsafe { handle.submit_response(stream_id, nva, data) }
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            // SAFETY: caller retains buffers/providers according to the trait contract.
+            unsafe { handle.submit_response(stream_id, nva, data) }
+        })
     }
     unsafe fn submit_headers(&self, flags: FrameFlags, stream_id: i32, pri: Option<&PrioritySpec>, nva: &[HeaderField<'_>], user_data: *mut c_void) -> Result<i32> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        // SAFETY: retained buffers and provider ownership follow the caller contract.
-        unsafe { handle.submit_headers(flags, stream_id, pri, nva, user_data) }
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            // SAFETY: caller retains buffers/providers according to the trait contract.
+            unsafe { handle.submit_headers(flags, stream_id, pri, nva, user_data) }
+        })
     }
     unsafe fn submit_data(&self, flags: FrameFlags, stream_id: i32, data: &mut DataProvider) -> Result<()> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        // SAFETY: retained buffers and provider ownership follow the caller contract.
-        unsafe { handle.submit_data(flags, stream_id, data) }
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            // SAFETY: caller retains buffers/providers according to the trait contract.
+            unsafe { handle.submit_data(flags, stream_id, data) }
+        })
     }
     unsafe fn submit_trailer(&self, stream_id: i32, nva: &[HeaderField<'_>]) -> Result<()> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        // SAFETY: retained buffers and provider ownership follow the caller contract.
-        unsafe { handle.submit_trailer(stream_id, nva) }
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            // SAFETY: caller retains buffers/providers according to the trait contract.
+            unsafe { handle.submit_trailer(stream_id, nva) }
+        })
     }
     fn submit_rst_stream(&self, flags: FrameFlags, stream_id: i32, error_code: ErrorCode) -> Result<()> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        handle.submit_rst_stream(flags, stream_id, error_code)
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            handle.submit_rst_stream(flags, stream_id, error_code)
+        })
     }
     fn submit_settings(&self, entries: &[SettingsEntry]) -> Result<()> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        handle.submit_settings(entries)
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            handle.submit_settings(entries)
+        })
     }
     fn submit_ping(&self, flags: FrameFlags, opaque: Option<&[u8; 8]>) -> Result<()> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        handle.submit_ping(flags, opaque)
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            handle.submit_ping(flags, opaque)
+        })
     }
     fn submit_goaway(&self, flags: FrameFlags, last_stream_id: i32, error_code: ErrorCode, opaque: &[u8]) -> Result<()> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        handle.submit_goaway(flags, last_stream_id, error_code, opaque)
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            handle.submit_goaway(flags, last_stream_id, error_code, opaque)
+        })
     }
     fn submit_window_update(&self, flags: FrameFlags, stream_id: i32, increment: i32) -> Result<()> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        handle.submit_window_update(flags, stream_id, increment)
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            handle.submit_window_update(flags, stream_id, increment)
+        })
     }
     fn submit_shutdown_notice(&self) -> Result<()> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        handle.submit_shutdown_notice()
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            handle.submit_shutdown_notice()
+        })
     }
     fn submit_altsvc(&self, flags: FrameFlags, stream_id: i32, origin: &[u8], field_value: &[u8]) -> Result<()> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        handle.submit_altsvc(flags, stream_id, origin, field_value)
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            handle.submit_altsvc(flags, stream_id, origin, field_value)
+        })
     }
     fn submit_origin(&self, flags: FrameFlags, origins: &[&[u8]]) -> Result<()> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        handle.submit_origin(flags, origins)
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            handle.submit_origin(flags, origins)
+        })
     }
     fn submit_priority_update(&self, flags: FrameFlags, stream_id: i32, field_value: &[u8]) -> Result<()> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        handle.submit_priority_update(flags, stream_id, field_value)
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            handle.submit_priority_update(flags, stream_id, field_value)
+        })
     }
     unsafe fn submit_extension(&self, type_: FrameType, flags: FrameFlags, stream_id: i32, payload: *mut c_void) -> Result<()> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        // SAFETY: retained buffers and provider ownership follow the caller contract.
-        unsafe { handle.submit_extension(type_, flags, stream_id, payload) }
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            // SAFETY: caller retains buffers/providers according to the trait contract.
+            unsafe { handle.submit_extension(type_, flags, stream_id, payload) }
+        })
     }
     fn change_extpri(&self, stream_id: i32, extpri: ExtPri, ignore_client_signal: bool) -> Result<()> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        handle.change_extpri(stream_id, extpri, ignore_client_signal)
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            handle.change_extpri(stream_id, extpri, ignore_client_signal)
+        })
     }
     fn extpri(&self, stream_id: i32) -> Result<ExtPri> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        handle.extpri(stream_id)
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            handle.extpri(stream_id)
+        })
     }
     fn consume(&self, stream_id: i32, size: usize) -> Result<()> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        handle.consume(stream_id, size)
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            handle.consume(stream_id, size)
+        })
     }
     fn consume_connection(&self, size: usize) -> Result<()> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        handle.consume_connection(size)
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            handle.consume_connection(size)
+        })
     }
     fn consume_stream(&self, stream_id: i32, size: usize) -> Result<()> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        handle.consume_stream(stream_id, size)
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            handle.consume_stream(stream_id, size)
+        })
     }
     fn set_local_window_size(&self, flags: FrameFlags, stream_id: i32, window_size: i32) -> Result<()> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        handle.set_local_window_size(flags, stream_id, window_size)
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            handle.set_local_window_size(flags, stream_id, window_size)
+        })
     }
     fn resume_data(&self, stream_id: i32) -> Result<()> {
-        // SAFETY: the context guarantees a live session for this borrow.
-        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
-        handle.resume_data(stream_id)
+        crate::session::with_pointer(self.as_ptr(), |handle| {
+            handle.resume_data(stream_id)
+        })
     }
 }
 
 #[cfg(test)]
 #[path = "../tests/support/submit.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "../tests/support/provider_terminal.rs"]
+mod terminal_tests;

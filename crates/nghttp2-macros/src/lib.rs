@@ -58,8 +58,8 @@ pub fn nv(input: TokenStream) -> TokenStream {
 /// `on_frame_send`, `on_frame_not_send`, `on_stream_close`, `on_begin_headers`,
 /// `on_header`, `on_header_rcbuf`, `on_invalid_header`, `select_padding`,
 /// `data_source_read_length`, `on_begin_frame`, `send_data`, `pack_extension`,
-/// `unpack_extension`, `on_extension_chunk_recv`, `error_callback2`, and
-/// `rand`.
+/// `unpack_extension`, `on_extension_chunk_recv`, and `error_callback2`.
+/// Randomness is supplied internally rather than through `SessionHandler`.
 #[proc_macro_attribute]
 pub fn nghttp2_callbacks(attr: TokenStream, item: TokenStream) -> TokenStream {
     match expand_callbacks(attr.into(), item.into()) {
@@ -69,7 +69,7 @@ pub fn nghttp2_callbacks(attr: TokenStream, item: TokenStream) -> TokenStream {
 }
 
 /// Callback methods that an `nghttp2` session can bind.
-const SESSION_CALLBACKS: [&str; 22] = [
+const SESSION_CALLBACKS: [&str; 21] = [
     "send",
     "recv",
     "on_frame_recv",
@@ -91,7 +91,6 @@ const SESSION_CALLBACKS: [&str; 22] = [
     "unpack_extension",
     "on_extension_chunk_recv",
     "error_callback2",
-    "rand",
 ];
 
 #[derive(Debug)]
@@ -402,6 +401,19 @@ mod tests {
     }
 
     #[test]
+    fn callbacks_reject_internal_randomness_hook() {
+        let item: ItemImpl = syn::parse_quote! {
+            impl SessionHandler for Handler { fn rand(&mut self) {} }
+        };
+        let error = validate_callback_impl(item).expect_err("rand is not a handler method");
+        assert!(
+            error
+                .to_string()
+                .contains("unknown session callback `rand`")
+        );
+    }
+
+    #[test]
     fn callbacks_reject_a_non_impl_item() {
         let error = expand_callbacks(
             TokenStream2::new(),
@@ -468,7 +480,6 @@ mod tests {
             "unpack_extension",
             "on_extension_chunk_recv",
             "error_callback2",
-            "rand",
         ];
         expected.sort_unstable();
 

@@ -1,7 +1,8 @@
 //! Bounded, tracked native allocation and externally supplied allocator tables.
 //!
 //! Keep the allocator alive until every native session or HPACK context using it
-//! has been destroyed. Borrowing the table does not transfer ownership. Built-in
+//! has been destroyed. Tracked state also survives until the last outstanding native
+//! allocation is freed. Borrowing the table does not transfer ownership. Built-in
 //! callbacks use a fixed alignment suitable for the native library's scalar
 //! allocations, keep metadata before each allocation, and never invoke user code.
 
@@ -40,10 +41,11 @@ pub struct AllocationStats {
     pub failed_allocations: usize,
 }
 
-#[derive(Default)]
 struct State {
     limit: Cell<usize>,
     stats: Cell<AllocationStats>,
+    owner_dropped: Cell<bool>,
+    raw: RawAllocator,
 }
 
 impl State {
@@ -63,10 +65,12 @@ impl State {
 /// temporarily coexists with the old block until its contents have been copied.
 /// HPACK's upstream `nghttp2_hd.c` retains `context->mem` rather than copying
 /// the table. Both the table and tracking state therefore have heap-stable
-/// addresses until this owner is dropped. Native users must be destroyed first.
+/// addresses while the owner or any tracked allocation remains alive. Native
+/// contexts must still be destroyed before their owner; escaped reference-counted
+/// buffers keep the tracked state and table alive until their final release.
 /// Externally supplied tables retain their own ownership and accounting contract.
 pub struct CustomAllocator {
-    raw: Box<RawAllocator>,
+    raw: NonNull<RawAllocator>,
     state: Option<NonNull<State>>,
     _single_thread: PhantomData<Rc<()>>,
 }
@@ -85,18 +89,26 @@ impl CustomAllocator {
 
     /// Creates an allocator that rejects requests exceeding `max_live_bytes`.
     pub fn with_limit(max_live_bytes: usize) -> Self {
-        let state = Box::new(State::default());
-        state.limit.set(max_live_bytes);
-        let state = Box::into_non_null(state);
-        let raw = RawAllocator {
-            mem_user_data: state.as_ptr().cast(),
-            malloc: Some(tracked_malloc),
-            free: Some(tracked_free),
-            calloc: Some(tracked_calloc),
-            realloc: Some(tracked_realloc),
+        let state = Box::into_non_null(Box::new(State {
+            limit: Cell::new(max_live_bytes),
+            stats: Cell::new(AllocationStats::default()),
+            owner_dropped: Cell::new(false),
+            raw: RawAllocator {
+                mem_user_data: ptr::null_mut(),
+                malloc: Some(tracked_malloc),
+                free: Some(tracked_free),
+                calloc: Some(tracked_calloc),
+                realloc: Some(tracked_realloc),
+            },
+        }));
+        // SAFETY: this uniquely owned allocation has not been exposed to native code.
+        // Neither the table nor its containing state moves after these pointers are formed.
+        let raw = unsafe {
+            (*state.as_ptr()).raw.mem_user_data = state.as_ptr().cast();
+            NonNull::new_unchecked(ptr::addr_of_mut!((*state.as_ptr()).raw))
         };
         Self {
-            raw: Box::new(raw),
+            raw,
             state: Some(state),
             _single_thread: PhantomData,
         }
@@ -112,7 +124,7 @@ impl CustomAllocator {
     /// by their originating allocator. The wrapper does not free external state.
     pub unsafe fn from_raw(raw: RawAllocator) -> Self {
         Self {
-            raw: Box::new(raw),
+            raw: Box::into_non_null(Box::new(raw)),
             state: None,
             _single_thread: PhantomData,
         }
@@ -121,7 +133,8 @@ impl CustomAllocator {
     /// Borrows the table. Native users must retain a borrow of this owner until
     /// their destruction; copying the raw table does not extend its lifetime.
     pub fn as_raw(&self) -> &RawAllocator {
-        &self.raw
+        // SAFETY: this owner retains the tracked state or externally supplied table.
+        unsafe { self.raw.as_ref() }
     }
 
     /// Returns counters for built-in tracking, or `None` for an external table.
@@ -147,9 +160,18 @@ impl CustomAllocator {
 impl Drop for CustomAllocator {
     fn drop(&mut self) {
         if let Some(state) = self.state.take() {
-            // SAFETY: this is the unique owner of the raw Box allocation;
-            // native users must have been destroyed before the allocator owner.
-            drop(unsafe { Box::from_raw(state.as_ptr()) });
+            // SAFETY: this owner retains the state until ownership is transferred
+            // to outstanding allocations; all accesses stay on the owning thread.
+            let allocation = unsafe { state.as_ref() };
+            allocation.owner_dropped.set(true);
+            if allocation.stats.get().live_blocks == 0 {
+                // SAFETY: no native allocations remain and this is the unique owner.
+                // The table resides inside State and is reclaimed with it.
+                drop(unsafe { Box::from_raw(state.as_ptr()) });
+            }
+        } else {
+            // SAFETY: from_raw owns this separately allocated table, but not its userdata.
+            drop(unsafe { Box::from_raw(self.raw.as_ptr()) });
         }
     }
 }
@@ -169,7 +191,7 @@ fn block_layout(requested: usize) -> Option<Layout> {
 
 // All helper calls are confined to callbacks with the same live boxed State.
 unsafe fn state<'a>(userdata: *mut c_void) -> &'a State {
-    // SAFETY: native users preserve the CustomAllocator owner and its boxed state.
+    // SAFETY: the owner or an outstanding tracked allocation retains the boxed state.
     unsafe { &*userdata.cast::<State>() }
 }
 
@@ -237,6 +259,7 @@ unsafe extern "C" fn tracked_free(pointer: *mut c_void, userdata: *mut c_void) {
     stats.live_bytes -= requested;
     stats.live_blocks -= 1;
     state.stats.set(stats);
+    let reclaim = stats.live_blocks == 0 && state.owner_dropped.get();
     // SAFETY: the size and alignment exactly reconstruct the successful allocation.
     unsafe {
         dealloc(
@@ -244,6 +267,11 @@ unsafe extern "C" fn tracked_free(pointer: *mut c_void, userdata: *mut c_void) {
             Layout::from_size_align_unchecked(layout_size, align_of::<Header>()),
         )
     };
+    if reclaim {
+        // SAFETY: the owner transferred its state/table to outstanding blocks.
+        // This was the final block, and the State borrow is no longer used.
+        drop(unsafe { Box::from_raw(userdata.cast::<State>()) });
+    }
 }
 
 unsafe extern "C" fn tracked_calloc(
