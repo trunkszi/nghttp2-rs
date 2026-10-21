@@ -11,7 +11,7 @@
 use proc_macro::TokenStream;
 use proc_macro2::TokenStream as TokenStream2;
 use quote::quote;
-use syn::{Ident, ImplItem, ItemImpl, LitByteStr, LitStr, Token, parse_macro_input};
+use syn::{Ident, ImplItem, ItemImpl, LitByteStr, LitStr, Token, ext::IdentExt, parse_macro_input};
 
 /// Expands `nv!("name", "value")` or `nv!("name", "value", no_index)` into a
 /// static header field.
@@ -174,7 +174,7 @@ fn validate_callback_impl(item: ItemImpl) -> syn::Result<ItemImpl> {
         let ImplItem::Fn(method) = impl_item else {
             continue;
         };
-        let name = method.sig.ident.to_string();
+        let name = method.sig.ident.unraw().to_string();
         if !SESSION_CALLBACKS.contains(&name.as_str()) {
             return Err(syn::Error::new(
                 method.sig.ident.span(),
@@ -375,6 +375,17 @@ mod tests {
         )
         .expect("impl parses");
         assert!(validate_callback_impl(item).is_err());
+    }
+
+    #[test]
+    fn callbacks_accept_raw_identifiers_without_rewriting_them() {
+        let item: ItemImpl = syn::parse_str(
+            "impl SessionHandler for Handler { fn r#send(&self) {} fn r#on_header(&self) {} }",
+        )
+        .expect("raw identifiers parse");
+        assert_eq!(validate_callback_impl(item.clone()).unwrap(), item);
+        let invalid: ItemImpl = syn::parse_str("impl Handler { fn r#on_headr(&self) {} }").unwrap();
+        assert!(validate_callback_impl(invalid).is_err());
     }
 
     #[test]

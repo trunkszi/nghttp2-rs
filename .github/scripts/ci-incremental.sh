@@ -103,7 +103,12 @@ if violations:
 print(f"==> async dependency check: {len(manifests)} manifests clean")
 PY
 
-if [ -z "$changed_files" ]; then
+# Scheduled and manually requested checks cover every package even with no diff.
+run_all_crates=0
+case "${GITHUB_EVENT_NAME:-}" in
+  schedule|workflow_dispatch) run_all_crates=1 ;;
+esac
+if [ -z "$changed_files" ] && [ "$run_all_crates" -eq 0 ]; then
   exit 0
 fi
 
@@ -114,11 +119,6 @@ if [ ! -f Cargo.toml ]; then
 fi
 
 # 4. Determine affected workspace crates from changed files.
-run_all_crates=0
-# A scheduled run must exercise every package, not only the last commit's diff.
-if [ "${GITHUB_EVENT_NAME:-}" = "schedule" ]; then
-  run_all_crates=1
-fi
 declare -A affected_map=()
 
 while IFS= read -r file; do
@@ -206,11 +206,12 @@ for pkg in "${selected_pkgs[@]}"; do
   cargo test --doc -p "$pkg"
 done
 
-# The default matrix builds `pre-release`; exercise the stable resolution on
-# full runs so the second feature path cannot rot silently.
-if [ "$run_all_crates" -eq 1 ]; then
-  echo "==> [stable] nghttp2-sys"
+# Native and safe-wrapper changes must also work against the stable library.
+if [ "$run_all_crates" -eq 1 ] || [ -n "${affected_map[nghttp2-sys]:-}" ] || [ -n "${affected_map[nghttp2]:-}" ]; then
+  echo "==> [stable] nghttp2-sys and nghttp2"
   cargo test -p nghttp2-sys --no-default-features --features stable
+  cargo test -p nghttp2 --no-default-features --features stable
+  cargo test --doc -p nghttp2 --no-default-features --features stable
 fi
 
 echo "==> Incremental CI succeeded for: ${selected_pkgs[*]}"

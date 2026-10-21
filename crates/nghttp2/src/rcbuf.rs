@@ -7,9 +7,9 @@
 //! needed.
 //!
 //! [`RcBuf`] is that reference: [`RcBuf::from_raw`] increments the count,
-//! [`RcBuf::as_slice`] borrows the bytes, and the [`Drop`] implementation decrements
-//! the count exactly once. Buffers allocated statically by the library report `true`
-//! from [`RcBuf::is_static`]; they carry no reference count, so taking and releasing
+//! [`RcBuf::as_slice`] borrows the bytes, and the final Rust handle releases the
+//! acquired native reference exactly once. Buffers allocated statically by the library report
+//! `true` from [`RcBuf::is_static`]; they carry no reference count, so taking and releasing
 //! a reference is a no-op and the bytes live for the lifetime of the process. A
 //! dynamically allocated buffer is freed when its last reference is released.
 //!
@@ -26,11 +26,24 @@ pub type RawBufferView = nghttp2_sys::nghttp2_vec;
 
 /// Owned reference to an [`nghttp2_rcbuf`].
 ///
-/// The wrapper keeps one reference count alive for as long as it lives and releases
-/// that reference on drop. It is neither `Send` nor `Sync` because the native object
-/// is opaque and the library makes no thread-safety guarantees about it.
+/// A group of Rust clones shares one acquired native reference. The final Rust
+/// handle releases that reference. Neither the wrapper nor its clones are `Send`
+/// or `Sync`; native reference-count operations must remain serialized.
+#[derive(Clone)]
 pub struct RcBuf {
+    inner: std::rc::Rc<Inner>,
+}
+
+struct Inner {
     raw: core::ptr::NonNull<RawRcBuf>,
+}
+
+impl Drop for Inner {
+    fn drop(&mut self) {
+        // SAFETY: this guard owns one acquired native reference; all Rust clones
+        // are gone, and the raw-constructor contract keeps its allocator alive.
+        unsafe { nghttp2_sys::nghttp2_rcbuf_decref(self.raw.as_ptr()) };
+    }
 }
 
 impl RcBuf {
@@ -38,14 +51,21 @@ impl RcBuf {
     ///
     /// Returns `None` when `raw` is null. Otherwise the reference count is
     /// incremented, which is a no-op for statically allocated buffers, and the
-    /// returned wrapper releases that reference when it is dropped.
+    /// final Rust clone releases that reference when it is dropped.
     ///
     /// # Safety
     ///
     /// `raw` must be null or a live pointer to an [`nghttp2_rcbuf`] that `nghttp2`
     /// currently keeps allocated, such as a name or value pointer passed to an
     /// `nghttp2_on_header_callback2` invocation. The buffer must not have been freed
-    /// by an earlier `nghttp2_rcbuf_decref` call.
+    /// by an earlier `nghttp2_rcbuf_decref` call. Its bytes must be initialized,
+    /// immutable, and readable for the lifetime of every resulting handle/borrow.
+    /// A dynamic buffer's native count must have room for one increment.
+    ///
+    /// A custom allocator's free callback must not unwind; its user data and backing
+    /// resources must remain valid until the last Rust clone is dropped, even after
+    /// the originating session has been destroyed. Cloning only changes Rust's
+    /// checked reference count; it does not acquire more native references.
     ///
     /// The reference taken here belongs to the returned wrapper; the caller must not
     /// pass the same acquisition to `nghttp2_rcbuf_decref`. A reference the library
@@ -60,7 +80,9 @@ impl RcBuf {
         // SAFETY: `NonNull::new` rejected the null pointer, and the caller
         // guarantees that the remaining pointer is a live nghttp2-managed buffer.
         unsafe { nghttp2_sys::nghttp2_rcbuf_incref(raw.as_ptr()) };
-        Some(Self { raw })
+        Some(Self {
+            inner: std::rc::Rc::new(Inner { raw }),
+        })
     }
 
     /// Returns the bytes stored in the buffer.
@@ -69,9 +91,9 @@ impl RcBuf {
     /// the borrow lives.
     #[must_use]
     pub fn as_slice(&self) -> &[u8] {
-        // SAFETY: `self.raw` stays allocated for the duration of the borrow and
+        // SAFETY: `self.inner` keeps the native reference alive during the borrow and
         // nghttp2 does not mutate the bytes through any other path.
-        let view = unsafe { nghttp2_sys::nghttp2_rcbuf_get_buf(self.raw.as_ptr()) };
+        let view = unsafe { nghttp2_sys::nghttp2_rcbuf_get_buf(self.inner.raw.as_ptr()) };
         if view.len == 0 {
             return &[];
         }
@@ -83,30 +105,12 @@ impl RcBuf {
     /// Returns whether the buffer was allocated statically by the library.
     ///
     /// Static buffers carry no reference count: the increments in
-    /// [`RcBuf::from_raw`] and [`Clone`] as well as the decrement in [`Drop`] do
-    /// nothing, and the bytes remain valid for the lifetime of the process.
+    /// [`RcBuf::from_raw`] and the final native decrement do nothing, and the
+    /// bytes remain valid for the lifetime of the process.
     #[must_use]
     pub fn is_static(&self) -> bool {
-        // SAFETY: `self.raw` is a live buffer for the duration of the borrow.
-        unsafe { nghttp2_sys::nghttp2_rcbuf_is_static(self.raw.as_ptr().cast_const()) != 0 }
-    }
-}
-
-impl Clone for RcBuf {
-    fn clone(&self) -> Self {
-        // SAFETY: `self` keeps a reference alive for the duration of this borrow, so
-        // the buffer is live. For static buffers the call does nothing.
-        unsafe { nghttp2_sys::nghttp2_rcbuf_incref(self.raw.as_ptr()) };
-        Self { raw: self.raw }
-    }
-}
-
-impl Drop for RcBuf {
-    fn drop(&mut self) {
-        // SAFETY: `from_raw` acquires one reference per wrapper and `Clone` acquires
-        // one per clone, so releasing exactly one reference here matches the count
-        // this value owns. For static buffers the call does nothing.
-        unsafe { nghttp2_sys::nghttp2_rcbuf_decref(self.raw.as_ptr()) };
+        // SAFETY: the shared Inner keeps the native buffer live during the borrow.
+        unsafe { nghttp2_sys::nghttp2_rcbuf_is_static(self.inner.raw.as_ptr().cast_const()) != 0 }
     }
 }
 
@@ -201,14 +205,60 @@ mod tests {
         assert!(!buffer.is_static());
 
         let clone = buffer.clone();
-        assert_eq!(ref_count(raw), 3);
-        drop(clone);
         assert_eq!(ref_count(raw), 2);
+        drop(buffer);
+        assert_eq!(ref_count(raw), 2);
+        let buffer = clone;
         assert_eq!(buffer.as_slice(), b"hello");
 
         drop(buffer);
         assert_eq!(ref_count(raw), 1);
         // SAFETY: this releases the reference returned by `nghttp2_rcbuf_new2`.
+        unsafe { nghttp2_sys::nghttp2_rcbuf_decref(raw) };
+    }
+
+    #[test]
+    fn forgotten_clones_do_not_increment_native() {
+        // SAFETY: the default allocator is static; this test owns the initial reference.
+        let raw = unsafe { new_buffer(b"bounded") };
+        // SAFETY: no other thread accesses this live buffer, and there is count headroom.
+        let buffer = unsafe { RcBuf::from_raw(raw) }.unwrap();
+        let inner = std::rc::Rc::into_raw(std::rc::Rc::clone(&buffer.inner));
+        for _ in 1..10_000 {
+            core::mem::forget(buffer.clone());
+        }
+        assert_eq!(ref_count(raw), 2);
+        assert_eq!(std::rc::Rc::strong_count(&buffer.inner), 10_001);
+        for _ in 0..10_000 {
+            // SAFETY: into_raw supplies this allocation's pointer; its retained
+            // count plus the forgotten clones total 10,000 owned strong counts.
+            // The surviving buffer keeps the allocation alive throughout cleanup.
+            unsafe { std::rc::Rc::decrement_strong_count(inner) };
+        }
+        drop(buffer);
+        assert_eq!(ref_count(raw), 1);
+        // SAFETY: the original native reference is still owned by this test.
+        unsafe { nghttp2_sys::nghttp2_rcbuf_decref(raw) };
+    }
+
+    #[test]
+    fn cloning_at_native_ceiling_is_safe() {
+        // SAFETY: the default allocator and buffer remain live until explicit release.
+        let raw = unsafe { new_buffer(b"ceiling") };
+        // SAFETY: the test-only layout mirrors the live native allocation. No
+        // concurrent accesses occur; restore the real count before native release.
+        unsafe { (*raw.cast::<RcBufLayout>()).ref_count = i32::MAX - 1 };
+        // SAFETY: the initialized immutable buffer has one increment of headroom.
+        let buffer = unsafe { RcBuf::from_raw(raw) }.unwrap();
+        let clone = buffer.clone();
+        assert_eq!(ref_count(raw), i32::MAX);
+        drop(clone);
+        assert_eq!(ref_count(raw), i32::MAX);
+        // SAFETY: remove the simulated external references before dropping owners.
+        unsafe { (*raw.cast::<RcBufLayout>()).ref_count = 2 };
+        drop(buffer);
+        assert_eq!(ref_count(raw), 1);
+        // SAFETY: release the original allocation's one remaining reference.
         unsafe { nghttp2_sys::nghttp2_rcbuf_decref(raw) };
     }
 

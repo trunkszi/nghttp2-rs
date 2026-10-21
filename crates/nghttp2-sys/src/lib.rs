@@ -15,6 +15,23 @@
 
 include!(concat!(env!("OUT_DIR"), "/bindings.rs"));
 
+/// Whether the resolved native library provides the outbound queue limit setter.
+pub const HAS_MAX_OUTBOUND_QUEUE_SIZE: bool = cfg!(nghttp2_has_max_outbound_queue_size);
+
+/// Returns the native setter when the resolved headers and library support it.
+#[must_use]
+pub const fn max_outbound_queue_size_setter()
+-> Option<unsafe extern "C" fn(*mut nghttp2_option, usize)> {
+    #[cfg(nghttp2_has_max_outbound_queue_size)]
+    {
+        Some(nghttp2_option_set_max_outbound_queue_size)
+    }
+    #[cfg(not(nghttp2_has_max_outbound_queue_size))]
+    {
+        None
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use core::{
@@ -23,6 +40,23 @@ mod tests {
     };
 
     use super::*;
+
+    #[test]
+    fn outbound_queue_capability_matches_the_native_setter() {
+        let setter = max_outbound_queue_size_setter();
+        assert_eq!(HAS_MAX_OUTBOUND_QUEUE_SIZE, setter.is_some());
+        if let Some(setter) = setter {
+            let mut option = core::ptr::null_mut();
+            // SAFETY: option is a writable output pointer.
+            assert_eq!(unsafe { nghttp2_option_new(&mut option) }, 0);
+            assert!(!option.is_null());
+            // SAFETY: option is live and exclusively owned until its deletion.
+            unsafe {
+                setter(option, 64);
+                nghttp2_option_del(option);
+            }
+        }
+    }
 
     #[test]
     fn public_struct_layout_matches_the_c_abi() {

@@ -105,8 +105,18 @@ impl SessionOptions {
         set_no_rfc9113_leading_and_trailing_ws_validation(enabled: bool) => nghttp2_option_set_no_rfc9113_leading_and_trailing_ws_validation(i32::from(enabled));
         /// Limits the number of CONTINUATION frames per header block.
         set_max_continuations(value: usize) => nghttp2_option_set_max_continuations(value);
-        /// Limits the outbound queue's frame count.
-        set_max_outbound_queue_size(value: usize) => nghttp2_option_set_max_outbound_queue_size(value);
+    }
+
+    /// Limits the outbound queue's frame count when the linked native API supports it.
+    ///
+    /// # Errors
+    /// Returns `NGHTTP2_ERR_INVALID_STATE` without changing options when this
+    /// setter is absent from the resolved native library, including nghttp2 1.70.0.
+    pub fn set_max_outbound_queue_size(&mut self, value: usize) -> Result<&mut Self, RawErrorCode> {
+        let setter = sys::max_outbound_queue_size_setter().ok_or(sys::NGHTTP2_ERR_INVALID_STATE)?;
+        // SAFETY: the capability resolver returns a linked setter; self owns live options.
+        unsafe { setter(self.raw.as_ptr(), value) };
+        Ok(self)
     }
 
     /// Sets the stream-reset token bucket's burst and replenishment rate.
@@ -155,9 +165,12 @@ mod tests {
             .set_server_fallback_rfc7540_priorities(true)
             .set_no_rfc9113_leading_and_trailing_ws_validation(true)
             .set_max_continuations(4)
-            .set_max_outbound_queue_size(100)
             .set_stream_reset_rate_limit(100, 10)
             .set_glitch_rate_limit(100, 10);
+        assert_eq!(
+            options.set_max_outbound_queue_size(100).is_ok(),
+            sys::HAS_MAX_OUTBOUND_QUEUE_SIZE
+        );
         let mut callbacks = std::ptr::null_mut();
         let mut session = std::ptr::null_mut();
         // SAFETY: both out-pointers are writable; callbacks remain alive through
@@ -183,6 +196,22 @@ mod tests {
                 17
             );
             sys::nghttp2_session_del(session);
+        }
+    }
+
+    #[test]
+    fn outbound_queue_capability_matches_native() {
+        let mut options = SessionOptions::new().unwrap();
+        let result = options.set_max_outbound_queue_size(1);
+        assert_eq!(result.is_ok(), sys::HAS_MAX_OUTBOUND_QUEUE_SIZE);
+        match result {
+            Ok(owner) => {
+                owner.set_max_outbound_ack(2);
+            }
+            Err(code) => {
+                assert_eq!(code, sys::NGHTTP2_ERR_INVALID_STATE);
+                options.set_max_outbound_ack(2);
+            }
         }
     }
 
