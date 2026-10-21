@@ -48,9 +48,9 @@ pub unsafe fn stream_id(stream: *mut RawStream) -> i32 {
 /// (`nghttp2_session_send`, `nghttp2_session_mem_send2`, `nghttp2_session_recv`,
 /// or `nghttp2_session_mem_recv2`); the root stream is the exception and lives
 /// for the duration of the process. The lifetime parameter ties the view to the
-/// borrow that produced it so a handle cannot outlive its session by ordinary
-/// borrowing alone; it cannot express the send/receive invalidation window,
-/// which callers must respect.
+/// borrow that produced it, but that borrow is of the pointer value, not of the
+/// session owner; neither the session lifetime nor the send/receive invalidation
+/// window can be enforced by this type, so callers must respect both.
 ///
 /// Two views compare equal exactly when they refer to the same native stream.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -65,7 +65,11 @@ impl<'a> StreamRef<'a> {
     /// The caller must guarantee that `stream` belongs to a session that is
     /// alive and that the view is not used across the send/receive calls listed
     /// on [`StreamRef`], except for the root stream.
-    pub(crate) fn from_ptr(stream: StreamPtr) -> Self {
+    ///
+    /// # Safety
+    ///
+    /// `stream` must be a live handle owned by a reachable session.
+    pub(crate) unsafe fn from_ptr(stream: StreamPtr) -> Self {
         Self {
             stream,
             _session: PhantomData,
@@ -77,7 +81,9 @@ impl<'a> StreamRef<'a> {
     /// `nghttp2` reports an absent dependency link or a missing stream as a null
     /// pointer; that maps to `None` rather than to an invalid handle.
     fn from_optional_ptr(stream: *mut RawStream) -> Option<Self> {
-        StreamPtr::new(stream).map(Self::from_ptr)
+        let stream = StreamPtr::new(stream)?;
+        // SAFETY: the public lookup that reaches this point requires a live session.
+        Some(unsafe { Self::from_ptr(stream) })
     }
 
     /// Returns the numeric stream identifier.
@@ -184,6 +190,10 @@ impl<'a> StreamRef<'a> {
 /// rejects inherent impls on a type defined outside the crate. The lookups are
 /// therefore provided by this trait; import it to call `session.find_stream(id)`
 /// or `session.root_stream()`.
+///
+/// `SessionPtr` is a bare pointer with a safe constructor, so a handle that does
+/// not come from a live session makes every lookup undefined behavior; only the
+/// session layer can hand out the encapsulated form.
 pub trait SessionStreams {
     /// Returns the stream with the given identifier, or `None` when the session
     /// does not have one.

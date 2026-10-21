@@ -98,7 +98,7 @@ impl DataProvider {
     pub fn from_vec_no_copy(data: Vec<u8>) -> Self { Self::new(VecSource { data, pos: 0, no_copy: true }) }
     /// Returns the descriptor nghttp2 copies into its queue; valid while `self` is alive, because `source.ptr` points into the stable heap state.
     pub fn as_raw(&self) -> *const RawDataProvider { ptr::from_ref(&self.raw) }
-    /// Removes the captured panic payload; a payload makes the session unusable.
+    /// Removes the captured panic payload; a payload poisons the provider, and re-submitting it is unsafe.
     pub fn take_panic(&mut self) -> Option<Box<dyn Any + Send>> {
         // SAFETY: `self` owns the allocation and no callback runs at the same time.
         unsafe { (*self.state).panic.take() }
@@ -270,7 +270,7 @@ impl SettingsEntry {
     pub fn as_raw(&self) -> nghttp2_settings_entry { nghttp2_settings_entry { settings_id: self.id.raw() as i32, value: self.value } }
 }
 
-/// Frame submission on a session. Submission only queues a frame; one that cannot be serialized later is abandoned through the `on_frame_not_send` notification.
+/// Frame submission on a live `SessionPtr` (forging one is undefined behavior); frames that cannot be sent are abandoned through `on_frame_not_send`.
 #[rustfmt::skip]
 pub trait SessionSubmit {
     /// Submits client request HEADERS and returns the new id; a provider suppresses `END_STREAM`.
@@ -399,7 +399,7 @@ impl SessionSubmit for SessionPtr {
     unsafe fn submit_response(&self, stream_id: i32, nva: &[HeaderField<'_>], data: Option<&mut DataProvider>) -> Result<()> {
         let raw = raw_headers(nva);
         let provider = data.map_or(ptr::null(), |provider| provider.as_raw());
-        // SAFETY: the session is live and every pointer outlives the call.
+        // SAFETY: the session is live; NO_COPY buffers and the provider follow the trait contract.
         status(unsafe { nghttp2_submit_response2(self.as_ptr(), stream_id, raw.as_ptr(), raw.len(), provider) })
     }
     unsafe fn submit_headers(&self, flags: FrameFlags, stream_id: i32, pri: Option<&PrioritySpec>, nva: &[HeaderField<'_>], user_data: *mut c_void) -> Result<i32> {
