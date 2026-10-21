@@ -28,13 +28,11 @@ permissions:
 jobs:
   ci:
     name: Unified Incremental CI
-    runs-on: [self-hosted, "${{ github.event_name == 'schedule' && 'nghttp2-rs-solo' || 'nghttp2-rs-lan' }}"]
+    runs-on: ubuntu-24.04
     timeout-minutes: 120
-    env:
-      RUSTC_WRAPPER: sccache
     steps:
       - name: Checkout sources
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           fetch-depth: 0
 
@@ -57,21 +55,8 @@ jobs:
       - name: Put the Rust toolchain on PATH
         run: echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
 
-      - name: Give sccache a server of its own
-        run: |
-          port="$(python3 -c 'import socket; s = socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')"
-          echo "SCCACHE_SERVER_PORT=$port" >> "$GITHUB_ENV"
-
       - name: Install Rust toolchain
         run: bash .github/scripts/install-rust-toolchain.sh
-
-      - name: Install gate tools
-        env:
-          RUSTC_WRAPPER: ""
-        run: |
-          for tool in cargo-nextest sccache; do
-            command -v "$tool" >/dev/null || cargo install "$tool" --locked
-          done
 
       - name: Resolve the diff base
         shell: bash
