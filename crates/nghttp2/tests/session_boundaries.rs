@@ -1,10 +1,11 @@
 //! Native lifecycle and flow-control boundary regressions using in-memory transport.
 use std::{cell::RefCell, rc::Rc};
 
+use anyhow::{Context, Result, bail};
 use nghttp2::{
     Client, ClientSession, CustomAllocator, DataPoll, DataProvider, DataSource, FrameFlags,
-    FrameType, HeaderField, RcBuf, Result, Server, ServerSession, Session, SessionCtx,
-    SessionEvent, SessionHandler, SessionOptions, SettingsEntry, SettingsId,
+    FrameType, HeaderField, RcBuf, Server, ServerSession, Session, SessionCtx, SessionEvent,
+    SessionHandler, SessionOptions, SettingsEntry, SettingsId,
     callbacks::{CallbackResult, Frame},
     nv,
 };
@@ -22,13 +23,16 @@ fn transfer<R, H: SessionHandler, S, G: SessionHandler>(
     to: &mut Session<S, G>,
 ) -> Result<()> {
     for _ in 0..128 {
-        let wire = from.mem_send()?.to_vec();
+        let wire = from
+            .mem_send()
+            .context("serialize boundary frames")?
+            .to_vec();
         if wire.is_empty() {
             return Ok(());
         }
         assert_eq!(to.mem_recv(&wire)?, wire.len());
     }
-    panic!("transport did not drain");
+    bail!("transport did not drain");
 }
 fn handshake<H: SessionHandler, G: SessionHandler>(
     client: &mut Session<Client, H>,
@@ -101,7 +105,9 @@ impl DataSource for FinalChunk {
     }
 }
 fn manual_pair(stream_window: u32) -> Result<(ClientSession, ServerSession)> {
-    let mut options = SessionOptions::new()?;
+    let mut options = SessionOptions::new()
+        .map_err(nghttp2::Error::from_native)
+        .context("create manual flow-control options")?;
     options.set_no_auto_window_update(true);
     let mut client = ClientSession::new_default(None, None)?;
     let mut server = ServerSession::new_default(Some(&options), None)?;

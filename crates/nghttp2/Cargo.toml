@@ -16,8 +16,12 @@ pre-release = ["nghttp2-sys/pre-release"]
 stable = ["nghttp2-sys/stable"]
 
 [dependencies]
+thiserror = { workspace = true }
 nghttp2-sys = { workspace = true }
 nghttp2-macros = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
 
 [lints]
 workspace = true

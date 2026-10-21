@@ -1,4 +1,5 @@
 //! In-memory HTTP/2 request and response, with DATA and trailing headers.
+use anyhow::{Context, Result, ensure};
 use nghttp2::{
     event::SessionEvent,
     nv::nv,
@@ -24,25 +25,40 @@ fn body(chunks: Vec<&'static [u8]>) -> DataProvider {
     })
 }
 
-fn pump(client: &mut ClientSession, server: &mut ServerSession) -> nghttp2::error::Result<()> {
+fn pump(client: &mut ClientSession, server: &mut ServerSession) -> Result<()> {
     loop {
         // Copy each borrowed native buffer before the next operation on its owner.
-        let request = client.mem_send()?.to_vec();
+        let request = client
+            .mem_send()
+            .context("serialize client frames")?
+            .to_vec();
         let request_len = request.len();
         if request_len != 0 {
-            assert_eq!(server.mem_recv(&request)?, request_len);
+            ensure!(
+                server.mem_recv(&request).context("parse request frames")? == request_len,
+                "server did not consume the complete request buffer"
+            );
         }
-        let response = server.mem_send()?.to_vec();
+        let response = server
+            .mem_send()
+            .context("serialize server frames")?
+            .to_vec();
         let response_len = response.len();
         if response_len != 0 {
-            assert_eq!(client.mem_recv(&response)?, response_len);
+            ensure!(
+                client
+                    .mem_recv(&response)
+                    .context("parse response frames")?
+                    == response_len,
+                "client did not consume the complete response buffer"
+            );
         }
         if request_len == 0 && response_len == 0 {
             return Ok(());
         }
     }
 }
-fn received(events: &[SessionEvent], stream: i32, expected: &[u8]) {
+fn received(events: &[SessionEvent], stream: i32, expected: &[u8]) -> Result<()> {
     let data: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
@@ -54,16 +70,23 @@ fn received(events: &[SessionEvent], stream: i32, expected: &[u8]) {
         .flatten()
         .copied()
         .collect();
-    assert_eq!(data, expected);
-    assert!(events.iter().any(|event| matches!(event,
-        SessionEvent::Header { stream_id, name, value, .. }
-        if *stream_id == stream && name == b"grpc-status" && value == b"0"
-    )));
+    ensure!(
+        data == expected,
+        "unexpected DATA payload on stream {stream}"
+    );
+    ensure!(
+        events.iter().any(|event| matches!(event,
+            SessionEvent::Header { stream_id, name, value, .. }
+            if *stream_id == stream && name == b"grpc-status" && value == b"0"
+        )),
+        "stream {stream} did not receive grpc-status 0"
+    );
+    Ok(())
 }
 
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let mut client = ClientSession::new_default(None, None)?;
-    let mut server = ServerSession::new_default(None, None)?;
+fn main() -> Result<()> {
+    let mut client = ClientSession::new_default(None, None).context("create client session")?;
+    let mut server = ServerSession::new_default(None, None).context("create server session")?;
     client.submit_settings(&[])?;
     server.submit_settings(&[])?;
     pump(&mut client, &mut server)?;
@@ -81,7 +104,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     client.submit_trailer(stream, &[nv!("grpc-status", "0")])?;
     pump(&mut client, &mut server)?;
     let request_events: Vec<_> = server.drain_events().collect();
-    received(&request_events, stream, b"ping");
+    received(&request_events, stream, b"ping").context("validate request")?;
 
     server.submit_response(
         stream,
@@ -98,12 +121,15 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     )?;
     pump(&mut client, &mut server)?;
     let response_events: Vec<_> = client.drain_events().collect();
-    received(&response_events, stream, b"pong");
+    received(&response_events, stream, b"pong").context("validate response")?;
     for events in [&response_events, &server.drain_events().collect()] {
-        assert!(events.iter().any(|event| matches!(event,
-            SessionEvent::StreamClose { stream_id, error_code }
-            if *stream_id == stream && *error_code == ErrorCode::NO_ERROR
-        )));
+        ensure!(
+            events.iter().any(|event| matches!(event,
+                SessionEvent::StreamClose { stream_id, error_code }
+                if *stream_id == stream && *error_code == ErrorCode::NO_ERROR
+            )),
+            "stream {stream} did not close cleanly on both endpoints"
+        );
     }
     println!("stream {stream}: request ping, response pong, grpc-status 0; both endpoints closed");
     Ok(())

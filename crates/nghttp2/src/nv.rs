@@ -368,30 +368,20 @@ impl<'a> From<HeaderField<'a>> for OwnedHeader {
 }
 
 /// Reason a header field failed validation.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, thiserror::Error)]
 pub enum InvalidHeader {
     /// The name is empty, contains a non-token byte, or contains uppercase.
+    #[error("invalid header name")]
     Name,
     /// The value contains a byte the library rejects, or, under RFC 9113 rules,
     /// begins or ends with SP or HTAB.
+    #[error("invalid header value")]
     Value,
     /// A `:authority` or `host` value contains a byte outside the authority
     /// character set or carries userinfo (`@`).
+    #[error("invalid :authority value")]
     Authority,
 }
-
-impl core::fmt::Display for InvalidHeader {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        let message = match self {
-            Self::Name => "invalid header name",
-            Self::Value => "invalid header value",
-            Self::Authority => "invalid :authority value",
-        };
-        f.write_str(message)
-    }
-}
-
-impl std::error::Error for InvalidHeader {}
 
 /// The `:method: POST` pseudo-header as a compile-time constant.
 ///

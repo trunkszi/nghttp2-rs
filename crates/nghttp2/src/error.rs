@@ -12,7 +12,7 @@
 //! the FFI boundary. Both types preserve the original code so log output never loses
 //! the value that the C library or the peer reported.
 
-use core::{ffi::CStr, fmt};
+use core::ffi::CStr;
 
 use nghttp2_sys::{
     NGHTTP2_ERR_DEFERRED, NGHTTP2_ERR_FATAL, NGHTTP2_ERR_PAUSE, NGHTTP2_ERR_WOULDBLOCK,
@@ -67,7 +67,8 @@ fn native_message(code: RawErrorCode) -> &'static str {
 }
 
 /// A native `nghttp2` error code together with its recovery classification.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, thiserror::Error)]
+#[error("{} (nghttp2 error {code})", self.message())]
 pub struct NgHttp2Error {
     code: RawErrorCode,
 }
@@ -103,14 +104,6 @@ impl NgHttp2Error {
     }
 }
 
-impl fmt::Display for NgHttp2Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} (nghttp2 error {})", self.message(), self.code)
-    }
-}
-
-impl std::error::Error for NgHttp2Error {}
-
 /// Recovery class of an [`Error`].
 #[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
 pub enum ErrorKind {
@@ -125,16 +118,19 @@ pub enum ErrorKind {
 }
 
 /// An error produced by the safe `nghttp2` wrapper.
-#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash)]
+#[derive(Copy, Clone, Debug, PartialEq, Eq, Hash, thiserror::Error)]
 pub enum Error {
     /// A native `nghttp2` error code.
-    Native(NgHttp2Error),
+    #[error("{0}")]
+    Native(#[from] NgHttp2Error),
     /// An HTTP/2 error code that belongs to a single stream.
+    #[error("{} (HTTP/2 error {})", .0.message(), .0.raw())]
     Stream(ErrorCode),
     /// A panic raised by a Rust callback and caught at the FFI boundary.
     ///
     /// The callback's state is unknown after a panic, so the session cannot be
     /// resumed and must be discarded.
+    #[error("{}", CALLBACK_PANICKED_MESSAGE)]
     CallbackPanicked,
 }
 
@@ -190,24 +186,6 @@ impl Error {
             Self::Stream(code) => code.message(),
             Self::CallbackPanicked => CALLBACK_PANICKED_MESSAGE,
         }
-    }
-}
-
-impl fmt::Display for Error {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::Native(error) => write!(f, "{error}"),
-            Self::Stream(code) => write!(f, "{} (HTTP/2 error {})", code.message(), code.raw()),
-            Self::CallbackPanicked => f.write_str(CALLBACK_PANICKED_MESSAGE),
-        }
-    }
-}
-
-impl std::error::Error for Error {}
-
-impl From<NgHttp2Error> for Error {
-    fn from(error: NgHttp2Error) -> Self {
-        Self::Native(error)
     }
 }
 

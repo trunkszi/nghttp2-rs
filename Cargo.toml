@@ -14,6 +14,8 @@ repository = "https://github.com/trunkszi/nghttp2-rs"
 publish = false
 
 [workspace.dependencies]
+thiserror = { version = "2.0" }
+anyhow = { version = "1.0" }
 nghttp2-sys = { path = "crates/nghttp2-sys" }
 nghttp2-macros = { path = "crates/nghttp2-macros" }
 cmake = { version = "0.1" }
