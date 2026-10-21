@@ -187,6 +187,57 @@ mod tests {
     }
 
     #[test]
+    fn integration_lifecycle_options_are_copied_for_each_session() {
+        let mut options = SessionOptions::new().unwrap();
+        let mut first = std::ptr::null_mut();
+        let mut second = std::ptr::null_mut();
+        let mut callbacks = std::ptr::null_mut();
+        // SAFETY: all constructor out-pointers are valid; callback/options owners
+        // survive construction and each successfully created session is deleted.
+        unsafe {
+            assert_eq!(sys::nghttp2_session_callbacks_new(&mut callbacks), 0);
+            options.set_peer_max_concurrent_streams(0);
+            assert_eq!(
+                sys::nghttp2_session_client_new2(
+                    &mut first,
+                    callbacks,
+                    std::ptr::null_mut(),
+                    options.as_ptr()
+                ),
+                0
+            );
+            options.set_peer_max_concurrent_streams(u32::MAX);
+            assert_eq!(
+                sys::nghttp2_session_client_new2(
+                    &mut second,
+                    callbacks,
+                    std::ptr::null_mut(),
+                    options.as_ptr()
+                ),
+                0
+            );
+            sys::nghttp2_session_callbacks_del(callbacks);
+            drop(options);
+            assert_eq!(
+                sys::nghttp2_session_get_remote_settings(
+                    first,
+                    sys::NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS
+                ),
+                0
+            );
+            assert_eq!(
+                sys::nghttp2_session_get_remote_settings(
+                    second,
+                    sys::NGHTTP2_SETTINGS_MAX_CONCURRENT_STREAMS
+                ),
+                u32::MAX
+            );
+            sys::nghttp2_session_del(first);
+            sys::nghttp2_session_del(second);
+        }
+    }
+
+    #[test]
     fn unit_scenario_boolean_options_can_be_disabled_again() {
         let mut options = SessionOptions::new().unwrap();
         options
