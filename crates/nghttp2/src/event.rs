@@ -74,6 +74,8 @@ pub enum SessionEvent {
         /// Frame flags.
         flags: u8,
         /// Stream the frame belongs to; zero for connection-level frames.
+        /// For a received PUSH_PROMISE this is the associated stream; header
+        /// events for the same frame carry the promised stream instead.
         stream_id: i32,
     },
     /// A frame left the session.
