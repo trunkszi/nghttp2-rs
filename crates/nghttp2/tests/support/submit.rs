@@ -691,9 +691,12 @@ fn integration_context_submits_control_frames_and_borrows_stream_views() {
     // SAFETY: the native session remains live for this scoped context.
     let ctx = unsafe { SessionCtx::from_raw(client.session) }.expect("live context");
     ctx.submit_settings(&[]).expect("settings through context");
-    ctx.submit_ping(FrameFlags::NONE, Some(b"ctx-ping"))
+    SessionSubmit::submit_ping(&ctx, FrameFlags::NONE, Some(b"ctx-ping"))
         .expect("ping through context");
-    assert_eq!(ctx.root_stream().expect("root stream").id(), 0);
+    assert_eq!(
+        SessionStreams::root_stream(&ctx).expect("root stream").id(),
+        0
+    );
     assert!(ctx.find_stream(99).is_none());
     let (wire, code) = client.send();
     assert_eq!(code, 0);
