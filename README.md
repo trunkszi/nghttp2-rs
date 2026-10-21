@@ -1,8 +1,8 @@
 # nghttp2-rs
 
-Safe, single-threaded Rust bindings for upstream [nghttp2](https://github.com/nghttp2/nghttp2). The workspace builds `libnghttp2` from source, checks the C ABI, and exposes a panic-safe HTTP/2 session, standalone HPACK, and the RFC 9218 / RFC 9113 helpers that sit on that ABI. There is no async runtime.
+Safe, single-threaded Rust bindings for upstream [nghttp2](https://github.com/nghttp2/nghttp2). The workspace builds `libnghttp2` from source, checks the C ABI, and exposes standalone HPACK plus the RFC 9218 / RFC 9113 helpers on that ABI. `Session<Client, H>` and `Session<Server, H>` below are the safe-wrapper contract: re-entrant `SessionCtx`, `SessionHandler`, `EventCollector`, and frame submission. There is no async runtime.
 
-The library is single-threaded on purpose. A `Session`, an HPACK context, an `RcBuf`, and a `CustomAllocator` are `!Send` and `!Sync`. Drive them from the thread that created them.
+HPACK contexts and `CustomAllocator` are `!Send` and `!Sync`. `RcBuf` must stay on the creating thread: its native reference count is not atomic, and the module contract forbids sharing it. Drive every native owner from that thread. Samples for `nv!`, HPACK, `SessionOptions`, `ExtPri`, ALPN, and `CustomAllocator` use types this crate exports today. Samples that call `Session::client`, `Session::server`, `submit_*`, or `DataProvider` follow the wrapper contract.
 
 ## Architecture
 
@@ -48,6 +48,7 @@ Features select the git ref used in step 3. `NGHTTP2_DIR` and `vendor/nghttp2` w
 [dependencies]
 nghttp2 = { path = "crates/nghttp2" }
 # nghttp2 = { path = "crates/nghttp2", default-features = false, features = ["stable"] }
+# nghttp2-macros = { path = "crates/nghttp2-macros" }  # only for #[nghttp2_callbacks]
 ```
 
 CMake is invoked with `ENABLE_LIB_ONLY=ON`, `ENABLE_STATIC_LIB=ON`, `ENABLE_SHARED_LIB=OFF`, `BUILD_STATIC_LIBS=ON`, `BUILD_SHARED_LIBS=OFF`, `BUILD_TESTING=OFF`, `ENABLE_DOC=OFF`, and `CMAKE_POSITION_INDEPENDENT_CODE=ON`. The static target is compiled with `NGHTTP2_STATICLIB`. The crate links `static=nghttp2` and refuses to finish if `libnghttp2.a` was not installed. Layout of every public value type is checked with C `_Static_assert` against that tree, and again from Rust with `size_of` and `offset_of!`.
@@ -206,7 +207,7 @@ let offered = b"\x02h2\x08http/1.1";
 assert_eq!(select_next_protocol(offered), Some(AlpnProtocol::Http2));
 ```
 
-`SessionOptions::new` returns the native code (`0` is success). `ExtPri::from_header` returns `NGHTTP2_ERR_INVALID_ARGUMENT` for a malformed Priority header.
+`SessionOptions::new` returns `Result<Self, RawErrorCode>` (`0` is success; the `Err` value is the native code). `ExtPri::from_header` returns `NGHTTP2_ERR_INVALID_ARGUMENT` for a malformed Priority header.
 
 A tracked allocator must outlive every session and HPACK context that borrowed it. After those users drop, `live_blocks` is zero when the library freed what it allocated:
 
@@ -225,7 +226,7 @@ assert_eq!(allocator.stats().map(|stats| stats.live_blocks), Some(0));
 
 `new_with_mem` is unsafe because the caller keeps the table and its userdata alive until the native object is destroyed. The built-in `CustomAllocator` satisfies that as long as it is dropped last.
 
-Client and server sessions over memory. `mem_send` borrows the library buffer, so the chunk is copied before the peer consumes it. The server answers from `on_frame_recv` through `SessionCtx`, not through the outer `&mut Session`.
+Client and server sessions over memory. `mem_send` borrows the library buffer, so the chunk is copied before the peer consumes it. The server answers from `on_frame_recv` through `SessionCtx`, not through the outer `&mut Session`. The types in this sample are the wrapper contract; this crate does not export `Session`, `SessionHandler`, `EventCollector`, or `DataProvider` yet.
 
 ```rust
 use nghttp2::callbacks::SessionHandler;
