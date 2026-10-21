@@ -10,14 +10,13 @@
 //! `&mut Session` that is driving the library: the phantom borrow is over the
 //! native `nghttp2_session`, which no Rust reference points to, not over the
 //! wrapper value that holds the pointer. A re-entrant call made inside a callback
-//! therefore cannot alias the owning session's mutable borrow.
+//! therefore cannot alias the owning session's mutable borrow. A call that
+//! dispatches another callback is refused by the handler's re-entry guard.
 //!
-//! The handle is deliberately neither `Copy` nor `Clone`. One value exists per
-//! callback invocation, and duplicating it would make it easy to keep a pointer
-//! past its validity window. That window is the callback invocation itself: the
-//! trampoline chooses `'a` so that it ends when the callback returns, so safe code
-//! cannot store the handle or use it from another thread. `SessionCtx` is `!Send`
-//! and `!Sync` because callbacks run synchronously on the session's thread.
+//! The handle is deliberately neither `Copy` nor `Clone`, and its constructor is
+//! crate-private. A handler receives it as `&mut SessionCtx<'_>`, so it cannot move
+//! the handle out or keep the borrow past the callback. `NonNull` also makes the
+//! handle `!Send` and `!Sync`, independent of the callbacks' thread affinity.
 
 use core::{marker::PhantomData, ptr::NonNull};
 

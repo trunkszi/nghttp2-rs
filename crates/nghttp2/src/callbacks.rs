@@ -1,10 +1,14 @@
 //! Session callbacks and panic-safe FFI trampolines: `user_data` points to a
 //! `CallbackBox<H>`, each method runs inside `catch_unwind`, and a panic becomes
-//! `NGHTTP2_ERR_CALLBACK_FAILURE`. The native `rand` callback has no `user_data`.
+//! `NGHTTP2_ERR_CALLBACK_FAILURE`. Re-entering the library from a handler is
+//! refused with the callback's failure code. The native `rand` callback has no
+//! `user_data`.
 
 use core::{
     any::Any,
+    cell::{Cell, RefCell, UnsafeCell},
     ffi::{c_char, c_int, c_void},
+    marker::PhantomData,
     panic::AssertUnwindSafe,
     ptr::NonNull,
 };
@@ -37,6 +41,8 @@ pub trait SessionHandler {
         NGHTTP2_ERR_WOULDBLOCK as nghttp2_ssize
     }
     /// Receives bytes into the supplied buffer.
+    ///
+    /// The buffer is uninitialized; write to it before reading.
     fn recv(&mut self, _: &mut SessionCtx<'_>, _: &mut [u8], _: c_int) -> nghttp2_ssize {
         NGHTTP2_ERR_WOULDBLOCK as nghttp2_ssize
     }
@@ -59,9 +65,7 @@ pub trait SessionHandler {
     /// A header name/value pair was received.
     fn on_header(&mut self, _: &mut SessionCtx<'_>, _: &Frame, _: &[u8], _: &[u8], _: u8) {}
     /// A header pair with reference-counted buffers was received.
-    ///
-    /// The default forwards to [`SessionHandler::on_header`]; override this method
-    /// to retain the buffers without copying.
+    /// The default forwards to [`SessionHandler::on_header`].
     fn on_header_rcbuf(
         &mut self,
         ctx: &mut SessionCtx<'_>,
@@ -109,6 +113,8 @@ pub trait SessionHandler {
         CALLBACK_FAILURE
     }
     /// Serializes an extension frame into the supplied buffer.
+    ///
+    /// The buffer is uninitialized; write to it before reading.
     fn pack_extension(&mut self, _: &mut SessionCtx<'_>, _: &mut [u8], _: &Frame) -> nghttp2_ssize {
         NGHTTP2_ERR_CANCEL as nghttp2_ssize
     }
@@ -128,27 +134,29 @@ pub trait SessionHandler {
 }
 
 /// Handler state stored in the session's `user_data` slot.
+///
+/// `in_callback` is the re-entry sentinel: while it is set, no other callback may
+/// touch `handler`.
 pub(crate) struct CallbackBox<H: SessionHandler> {
-    handler: H,
-    panic: Option<Box<dyn Any + Send>>,
+    handler: UnsafeCell<H>,
+    panic: RefCell<Option<Box<dyn Any + Send>>>,
+    in_callback: Cell<bool>,
 }
 
 #[allow(dead_code)] // consumed by the session layer, not by the callback table
 impl<H: SessionHandler> CallbackBox<H> {
     pub(crate) fn new(handler: H) -> Self {
         Self {
-            handler,
-            panic: None,
+            handler: UnsafeCell::new(handler),
+            panic: RefCell::new(None),
+            in_callback: Cell::new(false),
         }
     }
     pub(crate) fn handler_mut(&mut self) -> &mut H {
-        &mut self.handler
+        self.handler.get_mut()
     }
     pub(crate) fn take_panic(&mut self) -> Option<Box<dyn Any + Send>> {
-        self.panic.take()
-    }
-    fn capture_panic(&mut self, payload: Box<dyn Any + Send>) {
-        self.panic.get_or_insert(payload);
+        self.panic.get_mut().take()
     }
 }
 
@@ -156,20 +164,29 @@ fn with_handler<H: SessionHandler, R>(
     user_data: *mut c_void,
     session: *mut nghttp2_session,
     failure: R,
-    invoke: impl FnOnce(&mut CallbackBox<H>, &mut SessionCtx<'_>) -> R,
+    invoke: impl FnOnce(&mut H, &mut SessionCtx<'_>) -> R,
 ) -> R {
     if user_data.is_null() || session.is_null() {
         return failure;
     }
     // SAFETY: the session's user_data is the CallbackBox created for this handler,
     // and nghttp2 invokes callbacks synchronously on the session's thread.
-    let callback = unsafe { &mut *user_data.cast::<CallbackBox<H>>() };
+    let callback = unsafe { &*user_data.cast::<CallbackBox<H>>() };
+    if callback.in_callback.replace(true) {
+        // Re-entering the library would alias the outer handler reference.
+        return failure;
+    }
+    // SAFETY: the flag above guarantees exclusive access to the handler.
+    let handler = unsafe { &mut *callback.handler.get() };
     // SAFETY: the session pointer is live for the duration of the callback.
     let Some(mut ctx) = (unsafe { SessionCtx::from_raw(session) }) else {
+        callback.in_callback.set(false);
         return failure;
     };
-    catch_unwind(AssertUnwindSafe(|| invoke(callback, &mut ctx))).unwrap_or_else(|payload| {
-        callback.capture_panic(payload);
+    let result = catch_unwind(AssertUnwindSafe(|| invoke(handler, &mut ctx)));
+    callback.in_callback.set(false);
+    result.unwrap_or_else(|payload| {
+        callback.panic.borrow_mut().get_or_insert(payload);
         failure
     })
 }
@@ -184,9 +201,9 @@ macro_rules! frame_notification {
             if frame.is_null() {
                 return CALLBACK_FAILURE;
             }
-            with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |callback, ctx| {
+            with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |handler, ctx| {
                 // SAFETY: nghttp2 passes a live frame for this callback.
-                callback.handler.$method(ctx, unsafe { &*frame });
+                handler.$method(ctx, unsafe { &*frame });
                 0
             })
         }
@@ -213,6 +230,21 @@ macro_rules! callback_bytes {
     }};
 }
 
+macro_rules! callback_bytes_mut {
+    ($ptr:expr, $len:expr, $failure:expr) => {{
+        let ptr = $ptr;
+        let len = $len;
+        if len == 0 {
+            &mut [][..]
+        } else if ptr.is_null() {
+            return $failure;
+        } else {
+            // SAFETY: nghttp2 provides `len` writable bytes for the callback.
+            unsafe { core::slice::from_raw_parts_mut(ptr, len) }
+        }
+    }};
+}
+
 unsafe extern "C" fn trampoline_send<H: SessionHandler>(
     session: *mut nghttp2_session,
     data: *const u8,
@@ -224,9 +256,9 @@ unsafe extern "C" fn trampoline_send<H: SessionHandler>(
         user_data,
         session,
         CALLBACK_FAILURE as nghttp2_ssize,
-        |callback, ctx| {
+        |handler, ctx| {
             let data: &[u8] = callback_bytes!(data, length, CALLBACK_FAILURE as nghttp2_ssize);
-            callback.handler.send(ctx, data, flags)
+            handler.send(ctx, data, flags)
         },
     )
 }
@@ -242,16 +274,10 @@ unsafe extern "C" fn trampoline_recv<H: SessionHandler>(
         user_data,
         session,
         CALLBACK_FAILURE as nghttp2_ssize,
-        |callback, ctx| {
-            let buf: &mut [u8] = if length == 0 {
-                &mut []
-            } else if buf.is_null() {
-                return CALLBACK_FAILURE as nghttp2_ssize;
-            } else {
-                // SAFETY: nghttp2 provides `length` writable bytes for the call.
-                unsafe { core::slice::from_raw_parts_mut(buf, length) }
-            };
-            callback.handler.recv(ctx, buf, flags)
+        |handler, ctx| {
+            let buf: &mut [u8] =
+                callback_bytes_mut!(buf, length, CALLBACK_FAILURE as nghttp2_ssize);
+            handler.recv(ctx, buf, flags)
         },
     )
 }
@@ -267,8 +293,8 @@ macro_rules! frame_error_notification {
             if frame.is_null() {
                 return CALLBACK_FAILURE;
             }
-            with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |callback, ctx| {
-                callback.handler.$method(
+            with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |handler, ctx| {
+                handler.$method(
                     ctx,
                     // SAFETY: nghttp2 passes a live frame for this callback.
                     unsafe { &*frame },
@@ -291,11 +317,9 @@ unsafe extern "C" fn trampoline_on_data_chunk_recv<H: SessionHandler>(
     length: usize,
     user_data: *mut c_void,
 ) -> c_int {
-    with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |callback, ctx| {
+    with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |handler, ctx| {
         let data: &[u8] = callback_bytes!(data, length, CALLBACK_FAILURE);
-        callback
-            .handler
-            .on_data_chunk_recv(ctx, flags, stream_id, data);
+        handler.on_data_chunk_recv(ctx, flags, stream_id, data);
         0
     })
 }
@@ -306,10 +330,8 @@ unsafe extern "C" fn trampoline_on_stream_close<H: SessionHandler>(
     error_code: u32,
     user_data: *mut c_void,
 ) -> c_int {
-    with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |callback, ctx| {
-        callback
-            .handler
-            .on_stream_close(ctx, stream_id, ErrorCode::from_raw(error_code));
+    with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |handler, ctx| {
+        handler.on_stream_close(ctx, stream_id, ErrorCode::from_raw(error_code));
         0
     })
 }
@@ -325,7 +347,7 @@ unsafe extern "C" fn trampoline_on_header<H: SessionHandler>(
     if frame.is_null() {
         return CALLBACK_FAILURE;
     }
-    with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |callback, ctx| {
+    with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |handler, ctx| {
         // SAFETY: both buffers are live for the callback and `from_raw` takes its
         // own reference, released when the wrapper drops.
         let Some(name) = (unsafe { RcBuf::from_raw(name) }) else {
@@ -336,9 +358,7 @@ unsafe extern "C" fn trampoline_on_header<H: SessionHandler>(
             return CALLBACK_FAILURE;
         };
         // SAFETY: nghttp2 passes a live frame for this callback.
-        callback
-            .handler
-            .on_header_rcbuf(ctx, unsafe { &*frame }, &name, &value, flags);
+        handler.on_header_rcbuf(ctx, unsafe { &*frame }, &name, &value, flags);
         0
     })
 }
@@ -354,7 +374,7 @@ unsafe extern "C" fn trampoline_on_invalid_header<H: SessionHandler>(
     if frame.is_null() {
         return CALLBACK_FAILURE;
     }
-    with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |callback, ctx| {
+    with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |handler, ctx| {
         // SAFETY: both buffers are live for the callback; the wrappers are dropped
         // before returning, so the library's references are untouched.
         let Some(name) = (unsafe { RcBuf::from_raw(name) }) else {
@@ -365,7 +385,7 @@ unsafe extern "C" fn trampoline_on_invalid_header<H: SessionHandler>(
             return CALLBACK_FAILURE;
         };
         // SAFETY: nghttp2 passes a live frame for this callback.
-        callback.handler.on_invalid_header(
+        handler.on_invalid_header(
             ctx,
             unsafe { &*frame },
             name.as_slice(),
@@ -385,16 +405,12 @@ unsafe extern "C" fn trampoline_select_padding<H: SessionHandler>(
     if frame.is_null() {
         return CALLBACK_FAILURE as nghttp2_ssize;
     }
+    // SAFETY: nghttp2 passes a live frame for this callback.
     with_handler::<H, _>(
         user_data,
         session,
         CALLBACK_FAILURE as nghttp2_ssize,
-        |callback, ctx| {
-            // SAFETY: nghttp2 passes a live frame for this callback.
-            callback
-                .handler
-                .select_padding(ctx, unsafe { &*frame }, max_payload)
-        },
+        |handler, ctx| handler.select_padding(ctx, unsafe { &*frame }, max_payload),
     )
 }
 
@@ -411,8 +427,8 @@ unsafe extern "C" fn trampoline_data_source_read_length<H: SessionHandler>(
         user_data,
         session,
         CALLBACK_FAILURE as nghttp2_ssize,
-        |callback, ctx| {
-            callback.handler.data_source_read_length(
+        |handler, ctx| {
+            handler.data_source_read_length(
                 ctx,
                 FrameType::from_raw(frame_type),
                 stream_id,
@@ -432,9 +448,9 @@ unsafe extern "C" fn trampoline_on_begin_frame<H: SessionHandler>(
     if hd.is_null() {
         return CALLBACK_FAILURE;
     }
-    with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |callback, ctx| {
+    with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |handler, ctx| {
         // SAFETY: nghttp2 passes a live frame header for this callback.
-        callback.handler.on_begin_frame(ctx, unsafe { &*hd });
+        handler.on_begin_frame(ctx, unsafe { &*hd });
         0
     })
 }
@@ -450,14 +466,12 @@ unsafe extern "C" fn trampoline_send_data<H: SessionHandler>(
     if frame.is_null() || framehd.is_null() || source.is_null() {
         return CALLBACK_FAILURE;
     }
-    with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |callback, ctx| {
+    with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |handler, ctx| {
         // SAFETY: nghttp2 passes a live frame and data source for this call.
         let (frame, source) = unsafe { (&mut *frame, &mut *source) };
         // SAFETY: `send_data` always passes a 9-byte serialized frame header.
         let framehd = unsafe { core::slice::from_raw_parts(framehd, FRAME_HEADER_LEN) };
-        callback
-            .handler
-            .send_data(ctx, frame, framehd, length, source)
+        handler.send_data(ctx, frame, framehd, length, source)
     })
 }
 
@@ -475,19 +489,11 @@ unsafe extern "C" fn trampoline_pack_extension<H: SessionHandler>(
         user_data,
         session,
         CALLBACK_FAILURE as nghttp2_ssize,
-        |callback, ctx| {
-            let buf: &mut [u8] = if length == 0 {
-                &mut []
-            } else if buf.is_null() {
-                return CALLBACK_FAILURE as nghttp2_ssize;
-            } else {
-                // SAFETY: nghttp2 provides `length` writable bytes for the call.
-                unsafe { core::slice::from_raw_parts_mut(buf, length) }
-            };
+        |handler, ctx| {
+            let buf: &mut [u8] =
+                callback_bytes_mut!(buf, length, CALLBACK_FAILURE as nghttp2_ssize);
             // SAFETY: nghttp2 passes a live frame for this callback.
-            callback
-                .handler
-                .pack_extension(ctx, buf, unsafe { &*frame })
+            handler.pack_extension(ctx, buf, unsafe { &*frame })
         },
     )
 }
@@ -501,11 +507,9 @@ unsafe extern "C" fn trampoline_unpack_extension<H: SessionHandler>(
     if payload.is_null() || hd.is_null() {
         return CALLBACK_FAILURE;
     }
-    with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |callback, ctx| {
+    with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |handler, ctx| {
         // SAFETY: nghttp2 passes writable payload and a live header for this call.
-        callback
-            .handler
-            .unpack_extension(ctx, unsafe { &mut *payload }, unsafe { &*hd })
+        handler.unpack_extension(ctx, unsafe { &mut *payload }, unsafe { &*hd })
     })
 }
 
@@ -519,12 +523,10 @@ unsafe extern "C" fn trampoline_on_extension_chunk_recv<H: SessionHandler>(
     if hd.is_null() {
         return CALLBACK_FAILURE;
     }
-    with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |callback, ctx| {
+    with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |handler, ctx| {
         let data: &[u8] = callback_bytes!(data, length, CALLBACK_FAILURE);
         // SAFETY: nghttp2 passes a live frame header for this callback.
-        callback
-            .handler
-            .on_extension_chunk_recv(ctx, unsafe { &*hd }, data);
+        handler.on_extension_chunk_recv(ctx, unsafe { &*hd }, data);
         0
     })
 }
@@ -536,11 +538,9 @@ unsafe extern "C" fn trampoline_error_callback2<H: SessionHandler>(
     length: usize,
     user_data: *mut c_void,
 ) -> c_int {
-    with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |callback, ctx| {
+    with_handler::<H, _>(user_data, session, CALLBACK_FAILURE, |handler, ctx| {
         let message: &[u8] = callback_bytes!(message.cast::<u8>(), length, CALLBACK_FAILURE);
-        callback
-            .handler
-            .error_callback2(ctx, NgHttp2Error::from_raw(lib_error_code), message);
+        handler.error_callback2(ctx, NgHttp2Error::from_raw(lib_error_code), message);
         0
     })
 }
@@ -581,19 +581,20 @@ macro_rules! install {
     };
 }
 
-/// Owned native callback table with every trampoline installed.
+/// Owned native callback table with every trampoline installed for `H`.
 #[derive(Debug)]
-pub struct Callbacks {
+pub struct Callbacks<H: SessionHandler> {
     raw: NonNull<nghttp2_session_callbacks>,
+    _handler: PhantomData<fn() -> H>,
 }
 
-impl Callbacks {
+impl<H: SessionHandler> Callbacks<H> {
     /// Creates a table that routes every native callback to `H`.
     ///
     /// # Errors
     ///
     /// Returns the native allocation error when the table cannot be created.
-    pub fn new<H: SessionHandler>() -> Result<Self> {
+    pub fn new() -> Result<Self> {
         let mut raw = core::ptr::null_mut();
         // SAFETY: `raw` is a writable output pointer.
         let code = unsafe { nghttp2_sys::nghttp2_session_callbacks_new(&mut raw) };
@@ -601,7 +602,10 @@ impl Callbacks {
             return Err(Error::from_native(code));
         }
         let raw = NonNull::new(raw).ok_or(Error::from_native(nghttp2_sys::NGHTTP2_ERR_NOMEM))?;
-        let callbacks = Self { raw };
+        let callbacks = Self {
+            raw,
+            _handler: PhantomData,
+        };
         // SAFETY: every setter stores a monomorphized trampoline in the live table;
         // the table is not shared until construction finishes.
         unsafe {
@@ -635,13 +639,15 @@ impl Callbacks {
     }
 
     /// Returns the native table for session construction.
+    ///
+    /// The session's `user_data` must point at the box built for the same `H`.
     #[must_use]
     pub fn as_ptr(&self) -> *const nghttp2_session_callbacks {
         self.raw.as_ptr()
     }
 }
 
-impl Drop for Callbacks {
+impl<H: SessionHandler> Drop for Callbacks<H> {
     fn drop(&mut self) {
         // SAFETY: this value owns the only reference to the table.
         unsafe { nghttp2_sys::nghttp2_session_callbacks_del(self.raw.as_ptr()) };
@@ -652,28 +658,9 @@ impl Drop for Callbacks {
 mod tests {
     use super::*;
 
-    #[derive(Default)]
-    struct RecordingHandler {
-        stream_id: Option<i32>,
-        stream_error: Option<u32>,
-        lib_error: Option<i32>,
-        header_type: Option<u8>,
-        message: Vec<u8>,
-    }
+    struct TestHandler;
 
-    impl SessionHandler for RecordingHandler {
-        fn on_stream_close(&mut self, _: &mut SessionCtx<'_>, id: i32, code: ErrorCode) {
-            self.stream_id = Some(id);
-            self.stream_error = Some(code.raw());
-        }
-        fn on_begin_frame(&mut self, _: &mut SessionCtx<'_>, hd: &FrameHd) {
-            self.header_type = Some(hd.type_);
-        }
-        fn error_callback2(&mut self, _: &mut SessionCtx<'_>, err: NgHttp2Error, msg: &[u8]) {
-            self.lib_error = Some(err.raw());
-            self.message = msg.to_vec();
-        }
-    }
+    impl SessionHandler for TestHandler {}
 
     fn test_box<H: SessionHandler>(handler: H) -> (Box<CallbackBox<H>>, *mut c_void) {
         let mut boxed = Box::new(CallbackBox::new(handler));
@@ -695,8 +682,8 @@ mod tests {
 
     #[test]
     fn callbacks_install_on_a_real_session() {
-        let callbacks = Callbacks::new::<RecordingHandler>().expect("callback table");
-        let (_boxed, user_data) = test_box(RecordingHandler::default());
+        let callbacks = Callbacks::<TestHandler>::new().expect("callback table");
+        let (_boxed, user_data) = test_box(TestHandler);
         let mut session = core::ptr::null_mut();
         // SAFETY: the table and user data outlive the session; null option and
         // allocator select the library defaults.
@@ -736,47 +723,52 @@ mod tests {
     }
 
     #[test]
-    fn trampolines_convert_native_values() {
-        use nghttp2_sys::{NGHTTP2_CANCEL, NGHTTP2_ERR_INVALID_FRAME};
-        let (mut boxed, user_data) = test_box(RecordingHandler::default());
+    fn reentrant_callback_is_refused_and_the_guard_resets() {
+        let (_boxed, user_data) = test_box(TestHandler);
         let session = NonNull::<nghttp2_session>::dangling().as_ptr();
-        let hd = FrameHd {
-            length: 0,
-            stream_id: 3,
-            type_: 4,
-            flags: 0,
-            reserved: 0,
+        // The nested call hits the re-entry guard before it can touch the handler.
+        let outer =
+            with_handler::<TestHandler, c_int>(user_data, session, CALLBACK_FAILURE, |_, _| {
+                let inner = with_handler::<TestHandler, c_int>(
+                    user_data,
+                    session,
+                    CALLBACK_FAILURE,
+                    |_, _| 7,
+                );
+                assert_eq!(inner, CALLBACK_FAILURE);
+                42
+            });
+        assert_eq!(outer, 42);
+        // The guard must be clear again after the outer call returns.
+        let after =
+            with_handler::<TestHandler, c_int>(user_data, session, CALLBACK_FAILURE, |_, _| 9);
+        assert_eq!(after, 9);
+    }
+
+    #[test]
+    fn null_pointers_return_callback_failure() {
+        let (_boxed, user_data) = test_box(TestHandler);
+        let session = NonNull::<nghttp2_session>::dangling().as_ptr();
+        // SAFETY: each trampoline checks its null argument before dereferencing.
+        let code = unsafe {
+            trampoline_on_frame_recv::<TestHandler>(session, core::ptr::null(), user_data)
         };
-        // SAFETY: the session and frame pointers are valid for each call, and the
-        // handler only records values.
-        let close = unsafe {
-            trampoline_on_stream_close::<RecordingHandler>(session, 7, NGHTTP2_CANCEL, user_data)
+        assert_eq!(code, CALLBACK_FAILURE);
+        // SAFETY: the frame is valid; a null user_data is rejected before use.
+        let code = unsafe {
+            trampoline_on_frame_recv::<TestHandler>(session, &frame(0, 1), core::ptr::null_mut())
         };
-        // SAFETY: as above.
-        let begin =
-            unsafe { trampoline_on_begin_frame::<RecordingHandler>(session, &hd, user_data) };
-        // SAFETY: as above.
-        let error = unsafe {
-            trampoline_error_callback2::<RecordingHandler>(
-                session,
-                NGHTTP2_ERR_INVALID_FRAME,
-                b"bad".as_ptr().cast(),
-                3,
-                user_data,
-            )
+        assert_eq!(code, CALLBACK_FAILURE);
+        // SAFETY: a null session is rejected before any use.
+        let code = unsafe {
+            trampoline_on_frame_recv::<TestHandler>(core::ptr::null_mut(), &frame(0, 1), user_data)
         };
-        assert_eq!((close, begin, error), (0, 0, 0));
-        let handler = boxed.handler_mut();
-        assert_eq!(handler.stream_id, Some(7));
-        assert_eq!(handler.stream_error, Some(NGHTTP2_CANCEL));
-        assert_eq!(handler.lib_error, Some(NGHTTP2_ERR_INVALID_FRAME));
-        assert_eq!(handler.header_type, Some(4));
-        assert_eq!(handler.message, b"bad");
+        assert_eq!(code, CALLBACK_FAILURE);
     }
 
     #[test]
     fn control_defaults_are_protocol_safe() {
-        let mut handler = RecordingHandler::default();
+        let mut handler = TestHandler;
         let raw = NonNull::<nghttp2_session>::dangling().as_ptr();
         // SAFETY: the handle only stores the pointer; its methods never dereference it.
         let mut ctx = unsafe { SessionCtx::from_raw(raw) }.expect("non-null");
