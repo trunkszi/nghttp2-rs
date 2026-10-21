@@ -39,3 +39,20 @@ impl syn::parse::Parse for NvInput {
         })
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nv_input_requires_two_string_literals() {
+        let parsed: NvInput = syn::parse_str(r#"":method", "POST""#).expect("two literals parse");
+        assert_eq!(parsed.name.value(), ":method");
+        assert_eq!(parsed.value.value(), "POST");
+    }
+
+    #[test]
+    fn nv_input_rejects_extra_tokens() {
+        assert!(syn::parse_str::<NvInput>(r#"":method", "POST", "x""#).is_err());
+    }
+}

@@ -198,7 +198,7 @@ done
 for pkg in "${selected_pkgs[@]}"; do
   echo "==> [test] package: $pkg"
   if command -v cargo-nextest >/dev/null 2>&1; then
-    cargo nextest run -p "$pkg" --no-tests=pass
+    cargo nextest run -p "$pkg" --no-tests=fail
   else
     cargo test -p "$pkg"
   fi
