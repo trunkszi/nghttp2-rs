@@ -233,9 +233,21 @@ mod tests {
     }
 
     #[test]
+    fn nv_input_accepts_empty_literals() {
+        let parsed = parse_nv("\"\", \"\"").expect("empty literals are string literals");
+        assert_eq!(parsed.name.value(), "");
+        assert_eq!(parsed.value.value(), "");
+
+        let args = expansion_args(&parsed);
+        assert_eq!(byte_string(&args[0]), b"");
+        assert_eq!(byte_string(&args[1]), b"");
+    }
+
+    #[test]
     fn nv_input_rejects_trailing_tokens() {
         assert!(parse_nv(r#"":method", "POST", "extra""#).is_err());
         assert!(parse_nv(r#"":method", "POST" "extra""#).is_err());
+        assert!(parse_nv(r#"":method", "POST","#).is_err());
     }
 
     #[test]
@@ -248,6 +260,18 @@ mod tests {
     fn nv_input_rejects_a_non_literal_name() {
         assert!(parse_nv(r#"method, "POST""#).is_err());
         assert!(parse_nv(r#"42, "POST""#).is_err());
+    }
+
+    #[test]
+    fn nv_input_rejects_byte_string_literals() {
+        assert!(parse_nv("b\":method\", \"POST\"").is_err());
+        assert!(parse_nv("\":method\", b\"POST\"").is_err());
+    }
+
+    #[test]
+    fn nv_input_rejects_an_uppercase_no_index_flag() {
+        let error = parse_nv(r#"":method", "POST", NO_INDEX"#).expect_err("flags are lowercase");
+        assert!(error.to_string().contains("no_index"), "{error}");
     }
 
     #[test]
@@ -291,6 +315,19 @@ mod tests {
         assert_eq!(args.len(), 3);
         assert_eq!(byte_string(&args[0]), b"a\tb");
         assert_eq!(byte_string(&args[1]), b"c\nd");
+
+        let parsed = parse_nv(r#""a\u{0}", "b\u{7f}c""#).expect("unicode escapes decode");
+        let args = expansion_args(&parsed);
+        assert_eq!(byte_string(&args[0]), b"a\0");
+        assert_eq!(byte_string(&args[1]), b"b\x7fc");
+    }
+
+    #[test]
+    fn expand_nv_keeps_multibyte_utf8_bytes() {
+        let parsed = parse_nv(r#""x-café", "naïve ☕""#).expect("non-ASCII literals parse");
+        let args = expansion_args(&parsed);
+        assert_eq!(byte_string(&args[0]), "x-café".as_bytes());
+        assert_eq!(byte_string(&args[1]), "naïve ☕".as_bytes());
     }
 
     #[test]
@@ -307,6 +344,33 @@ mod tests {
             expand_callbacks(TokenStream2::new(), quote!(#original)).expect("valid impl expands");
         let reparsed: ItemImpl = syn::parse2(expanded).expect("output is one impl block");
         assert_eq!(reparsed, original);
+    }
+
+    #[test]
+    fn callbacks_check_names_regardless_of_the_implemented_trait() {
+        let foreign: ItemImpl =
+            syn::parse_str("impl Other for Handler { fn send(&self) {} }").expect("impl parses");
+        assert!(validate_callback_impl(foreign).is_ok());
+
+        let inherent: ItemImpl =
+            syn::parse_str("impl Handler { fn on_headr(&self) {} }").expect("impl parses");
+        let error = validate_callback_impl(inherent).expect_err("the check is name-based");
+        assert!(error.to_string().contains("on_headr"), "{error}");
+    }
+
+    #[test]
+    fn callbacks_ignore_non_function_impl_items() {
+        let item: ItemImpl = syn::parse_str(
+            "impl SessionHandler for Handler { const ID: u8 = 1; type Output = (); }",
+        )
+        .expect("impl parses");
+        assert!(validate_callback_impl(item).is_ok());
+
+        let item: ItemImpl = syn::parse_str(
+            "impl SessionHandler for Handler { const ID: u8 = 1; fn on_headr(&self) {} }",
+        )
+        .expect("impl parses");
+        assert!(validate_callback_impl(item).is_err());
     }
 
     #[test]
@@ -335,6 +399,20 @@ mod tests {
             error.to_string(),
             "nghttp2_callbacks must be applied to an impl block"
         );
+
+        let error = expand_callbacks(
+            TokenStream2::new(),
+            quote!(
+                trait SessionHandler {
+                    fn send(&self) {}
+                }
+            ),
+        )
+        .expect_err("a trait definition is rejected");
+        assert_eq!(
+            error.to_string(),
+            "nghttp2_callbacks must be applied to an impl block"
+        );
     }
 
     #[test]
@@ -350,15 +428,35 @@ mod tests {
 
     #[test]
     fn callback_allowlist_is_complete_and_unique() {
-        assert_eq!(SESSION_CALLBACKS.len(), 22);
-        assert!(SESSION_CALLBACKS.contains(&"send"));
-        assert!(SESSION_CALLBACKS.contains(&"on_header"));
+        let mut actual = SESSION_CALLBACKS;
+        actual.sort_unstable();
 
-        let mut names = SESSION_CALLBACKS;
-        names.sort_unstable();
-        assert!(
-            names.windows(2).all(|pair| pair[0] != pair[1]),
-            "duplicate entries would hide a missing callback"
-        );
+        let mut expected = [
+            "send",
+            "recv",
+            "on_frame_recv",
+            "on_invalid_frame_recv",
+            "on_data_chunk_recv",
+            "before_frame_send",
+            "on_frame_send",
+            "on_frame_not_send",
+            "on_stream_close",
+            "on_begin_headers",
+            "on_header",
+            "on_header_rcbuf",
+            "on_invalid_header",
+            "select_padding",
+            "data_source_read_length",
+            "on_begin_frame",
+            "send_data",
+            "pack_extension",
+            "unpack_extension",
+            "on_extension_chunk_recv",
+            "error_callback2",
+            "rand",
+        ];
+        expected.sort_unstable();
+
+        assert_eq!(actual, expected);
     }
 }

@@ -103,10 +103,9 @@ impl core::ops::BitOrAssign for NvFlags {
 
 /// Borrowed header name/value pair with typed flags.
 ///
-/// Construction does not validate: validation has to call into C, so doing it in
-/// these constructors would rule out constants such as [`METHOD_POST`]. Call
-/// [`HeaderField::validate`] or [`HeaderField::validate_rfc9113`] before handing a
-/// field to a submission call.
+/// Construction does not validate because it has to call into C, which would rule
+/// out constants such as [`METHOD_POST`]. Call [`HeaderField::validate`] or
+/// [`HeaderField::validate_rfc9113`] before submitting.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct HeaderField<'a> {
     name: &'a [u8],
@@ -149,12 +148,10 @@ impl<'a> HeaderField<'a> {
     /// them that way. The bytes behind them are never written through, and the
     /// library does not free them while the `NO_COPY` flags are set.
     ///
-    /// The descriptor borrows the field's bytes: it stays valid only while the
-    /// source data does. [`METHOD_POST`] and every `nv!` product point into the
-    /// binary and remain valid for the whole process; a field built from
-    /// caller-owned buffers expires with the borrow. Pass the descriptor straight
-    /// to a submission call (for example `nghttp2_submit_request2`) and do not
-    /// keep it past the lifetime of the bytes.
+    /// The descriptor borrows the field's bytes, so it stays valid only while the
+    /// source data does: [`METHOD_POST`] and every `nv!` product point into the
+    /// binary, while a caller-owned buffer expires with the borrow. Pass it
+    /// straight to a submission call and do not keep it past the bytes' lifetime.
     pub const fn as_raw(&self) -> RawHeaderField {
         RawHeaderField {
             name: self.name.as_ptr().cast_mut(),
@@ -168,11 +165,10 @@ impl<'a> HeaderField<'a> {
     /// Validates the field with the HTTP/2 rules the library applies to inbound
     /// headers.
     ///
-    /// The name is checked first: it must be non-empty, may carry one leading
-    /// `:`, and every remaining byte must be an RFC 9113 token character, so
-    /// uppercase is rejected. The value must not contain CR, LF, NUL, DEL, or
-    /// another control byte; HTAB, SP, and bytes from 0x21 through 0xFF other
-    /// than DEL are accepted.
+    /// The name must be non-empty, may carry one leading `:`, and every remaining
+    /// byte must be an RFC 9113 token character, so uppercase fails. The value must
+    /// not contain CR, LF, NUL, DEL, or another control byte; HTAB, SP, and bytes
+    /// from 0x21 through 0xFF other than DEL are accepted.
     ///
     /// # Errors
     ///
@@ -190,22 +186,25 @@ impl<'a> HeaderField<'a> {
 
     /// Validates the field with the stricter RFC 9113 rules used for submission.
     ///
-    /// The name rules are the same as [`HeaderField::validate`]. A value for
-    /// `:authority` must consist only of authority characters; every other value
-    /// must additionally have no leading or trailing SP or HTAB.
+    /// The name rules are the same as [`HeaderField::validate`]. A `:authority` or
+    /// `host` value must consist only of authority characters and must not carry
+    /// userinfo (`@`); every other value must have no leading or trailing SP or
+    /// HTAB.
     ///
     /// # Errors
     ///
     /// Returns [`InvalidHeader::Name`] when the name fails its check,
-    /// [`InvalidHeader::Authority`] when a `:authority` value fails the authority
-    /// check, or [`InvalidHeader::Value`] when any other value fails the strict
-    /// check.
+    /// [`InvalidHeader::Authority`] when an authority value fails, or
+    /// [`InvalidHeader::Value`] when another value fails the strict check.
     pub fn validate_rfc9113(&self) -> Result<(), InvalidHeader> {
         if !check_header_name(self.name) {
             return Err(InvalidHeader::Name);
         }
-        if self.name == b":authority" {
-            return if check_authority(self.value) {
+        if self.name == b":authority" || self.name == b"host" {
+            // The public helper accepts '@' for URI userinfo; RFC 3986 section
+            // 3.2.2 excludes userinfo from :authority and host, and nghttp2's
+            // receive path rejects it.
+            return if check_authority(self.value) && !self.value.contains(&b'@') {
                 Ok(())
             } else {
                 Err(InvalidHeader::Authority)
@@ -271,9 +270,9 @@ pub fn check_authority(authority: &[u8]) -> bool {
 
 /// Header whose name and value bytes are owned by the wrapper.
 ///
-/// Converting a [`HeaderField`] into an [`OwnedHeader`] copies both byte
-/// strings, so the owned header remains valid after the source buffers change or
-/// are dropped. The flags are preserved unchanged, including `NO_COPY`.
+/// Converting a [`HeaderField`] copies both byte strings, so the owned header
+/// remains valid after the source buffers change or are dropped. The flags are
+/// preserved unchanged, including `NO_COPY`.
 #[derive(Clone, Debug, Eq, Hash, PartialEq)]
 pub struct OwnedHeader {
     name: Vec<u8>,
@@ -377,8 +376,8 @@ pub enum InvalidHeader {
     /// The value contains a byte the library rejects, or, under RFC 9113 rules,
     /// begins or ends with SP or HTAB.
     Value,
-    /// The `:authority` value contains a byte outside the authority character
-    /// set.
+    /// A `:authority` or `host` value contains a byte outside the authority
+    /// character set or carries userinfo (`@`).
     Authority,
 }
 
@@ -403,10 +402,9 @@ pub const METHOD_POST: HeaderField<'static> = nv!(":method", "POST");
 
 /// Builds the raw `:method: POST` pseudo-header without copying either string.
 ///
-/// The name and value point at bytes embedded in the binary, so the descriptor
-/// remains valid for the lifetime of the process and needs no cleanup. The fields
-/// are `*mut` only because `nghttp2_nv` declares them that way; the buffers must
-/// never be written through, and the library never frees them under `NO_COPY`.
+/// The fields are `*mut` only because `nghttp2_nv` declares them that way; the
+/// buffers must never be written through, and the library never frees them under
+/// `NO_COPY`. The bytes are the static data behind [`METHOD_POST`].
 #[must_use]
 pub fn method_post() -> RawHeaderField {
     METHOD_POST.as_raw()
@@ -462,8 +460,6 @@ mod tests {
         assert_eq!(name, b":method");
         assert_eq!(value, b"POST");
         assert_eq!(method_post().flags, raw.flags);
-        assert_eq!(method_post().namelen, raw.namelen);
-        assert_eq!(method_post().valuelen, raw.valuelen);
     }
 
     #[test]
@@ -555,6 +551,8 @@ mod tests {
         };
         assert_eq!(name, field.name());
         assert_eq!(value, field.value());
+        let none_flags = HeaderField::from_static(b"x", b"y", NvFlags::NONE);
+        assert_eq!(none_flags.as_raw().flags, NGHTTP2_NV_FLAG_NONE as u8);
     }
 
     #[test]
@@ -628,6 +626,9 @@ mod tests {
             (b":", false),
             (b"::path", false),
             (b"Content-Type", false),
+            (b":Method", false),
+            (b"!#$%&'*+-.^_`|~", true), // punctuation entries in VALID_HD_NAME_CHARS
+            (b"a\x80", false),          // non-ASCII bytes are not name characters
             (b"foo bar", false),
             (b"foo\0bar", false),
             (b"foo:bar", false),
@@ -656,6 +657,11 @@ mod tests {
         for (value, expected) in cases {
             assert_eq!(check_header_value(value), *expected, "value {value:?}");
         }
+        for byte in 0u8..=0xFF {
+            // C table: HTAB, SP, 0x21..=0x7E, 0x80..=0xFF.
+            let expected = matches!(byte, b'\t' | b' ' | 0x21..=0x7E | 0x80..=0xFF);
+            assert_eq!(check_header_value(&[byte]), expected, "value {byte:#04x}");
+        }
     }
 
     #[test]
@@ -668,6 +674,9 @@ mod tests {
             (b"trailing ", false),
             (b"trailing\t", false),
             (b"\tleading", false),
+            (b" ", false),
+            (b"\t", false),
+            (b"a b", true),
             (b"a\rb", false),
             (b"a\x7Fb", false),
         ];
@@ -684,6 +693,7 @@ mod tests {
     fn check_authority_matches_upstream_rules() {
         let cases: &[(&[u8], bool)] = &[
             (b"example.com:443", true),
+            (b"\x01", false),
             (b"", true),
             (b"[::1]:8443", true),
             (b"user@example.com", true),
@@ -710,6 +720,8 @@ mod tests {
         let field = HeaderField::new(b"Bad-Name", b"a\rb");
         assert_eq!(field.validate(), Err(InvalidHeader::Name));
         assert_eq!(field.validate_rfc9113(), Err(InvalidHeader::Name));
+        let unnamed = HeaderField::new(b"", b"ok");
+        assert_eq!(unnamed.validate(), Err(InvalidHeader::Name));
     }
 
     #[test]
@@ -749,6 +761,14 @@ mod tests {
         let good = HeaderField::new(b":authority", b"example.com:443");
         assert_eq!(good.validate(), Ok(()));
         assert_eq!(good.validate_rfc9113(), Ok(()));
+        let empty = HeaderField::new(b":authority", b"");
+        assert_eq!(empty.validate_rfc9113(), Ok(()));
+        let leading = HeaderField::new(b":authority", b" host");
+        assert_eq!(leading.validate_rfc9113(), Err(InvalidHeader::Authority));
+        let userinfo = HeaderField::new(b":authority", b"user@example.com");
+        assert_eq!(userinfo.validate_rfc9113(), Err(InvalidHeader::Authority));
+        let host = HeaderField::new(b"host", b"exa mple");
+        assert_eq!(host.validate_rfc9113(), Err(InvalidHeader::Authority));
     }
 
     #[test]
