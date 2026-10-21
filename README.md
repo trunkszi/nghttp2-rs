@@ -1,8 +1,8 @@
 # nghttp2-rs
 
-Safe, single-threaded Rust bindings for upstream [nghttp2](https://github.com/nghttp2/nghttp2). The workspace builds `libnghttp2` from source, checks the C ABI, and exposes standalone HPACK plus the RFC 9218 / RFC 9113 helpers on that ABI. `Session<Client, H>` and `Session<Server, H>` below are the safe-wrapper contract: re-entrant `SessionCtx`, `SessionHandler`, `EventCollector`, and frame submission. There is no async runtime.
+Safe, single-threaded Rust bindings for upstream [nghttp2](https://github.com/nghttp2/nghttp2). The workspace builds `libnghttp2` from source, checks the C ABI, and exports client/server sessions, standalone HPACK, and the RFC 9218 / RFC 9113 helpers. `Session<Client, H>` and `Session<Server, H>` provide re-entrant `SessionCtx` callbacks, `SessionHandler`, `EventCollector`, and frame submission. There is no async runtime.
 
-HPACK contexts and `CustomAllocator` are `!Send` and `!Sync`. `RcBuf` must stay on the creating thread: its native reference count is not atomic, and the module contract forbids sharing it. Drive every native owner from that thread. Samples for `nv!`, HPACK, `SessionOptions`, `ExtPri`, ALPN, and `CustomAllocator` use types this crate exports today. Samples that call `Session::client`, `Session::server`, `submit_*`, or `DataProvider` follow the wrapper contract.
+HPACK contexts and `CustomAllocator` are `!Send` and `!Sync`. `RcBuf` must stay on the creating thread: its native reference count is not atomic, and the module contract forbids sharing it. Drive every native owner from that thread. The examples below use the exported API, including `Session::client`, `Session::server`, `submit_*`, and `DataProvider`.
 
 ## Architecture
 
@@ -108,10 +108,10 @@ Defaults are deliberate. `send` and `recv` return `NGHTTP2_ERR_WOULDBLOCK`. `sel
 | `submit_extension` | An extension frame packed by `pack_extension`. |
 | `change_extpri` | Local RFC 9218 urgency without a frame of its own. |
 
-**`DataProvider`.** A buffered provider copies from a byte slice. A streaming provider is polled until it reports end of stream. Two flags change that path:
+**`DataProvider`.** `from_vec` owns a byte buffer and copies its contents into native DATA frames. `new` owns a streaming `DataSource` that is polled until it reports end of stream. Two flags change that path:
 
 - `NGHTTP2_DATA_FLAG_NO_COPY` skips nghttp2's internal copy (the library's send buffer is 16 KiB). The provider's bytes stay pinned until `on_frame_send`, `on_frame_not_send`, or `on_stream_close`. `send_data` then writes the 9-byte frame header plus those bytes.
-- Returning `submit::DEFERRED` (`NGHTTP2_ERR_DEFERRED`) pauses the stream. `resume_data(stream_id)` continues it. The provider is not polled again before that call.
+- Returning `DataPoll::Deferred` from `DataSource::read` pauses the stream. `resume_data(stream_id)` continues it. The provider is not polled again before that call.
 
 **HPACK.** `HpDeflater` and `HpInflater` are independent of a session. The deflater takes a hard dynamic-table cap; `change_table_size` applies the peer's `SETTINGS_HEADER_TABLE_SIZE` up to that cap. `deflate_bound` sizes the output; `deflate_vec` allocates it. A native encode error poisons that deflater. The inflater streams with `inflate_step` (`final_chunk` on the last slice, then `end_headers` once `finished` is set) or decodes a whole block with `inflate_block`. A decode error is permanent. Both types expose static plus dynamic table size and 1-based entry lookup.
 
@@ -135,7 +135,7 @@ Defaults are deliberate. `send` and `recv` return `NGHTTP2_ERR_WOULDBLOCK`. `sel
 | `set_server_fallback_rfc7540_priorities` | Serve peers that still send RFC 7540 priority. |
 | `set_no_rfc9113_leading_and_trailing_ws_validation` | Accept leading or trailing SP/HTAB in values. |
 | `set_max_continuations` | Cap on `CONTINUATION` frames per header block. |
-| `set_max_outbound_queue_size` | Cap on queued outbound frames. |
+| `set_max_outbound_queue_size` | Cap on queued outbound frames; returns an error if the resolved native library lacks this setter. |
 | `set_stream_reset_rate_limit` | Token bucket `(burst, rate)` for stream resets. |
 | `set_glitch_rate_limit` | Token bucket `(burst, rate)` for protocol glitches. |
 
@@ -145,11 +145,11 @@ Defaults are deliberate. `send` and `recv` return `NGHTTP2_ERR_WOULDBLOCK`. `sel
 
 **RFC 9113 header checks.** `check_header_name` requires a non-empty lowercase token with at most one leading colon. `check_header_value` rejects CR, LF, NUL, and other controls except HTAB and SP. `check_header_value_rfc9113` also rejects leading and trailing SP/HTAB. `check_authority` allows URI authority bytes and rejects SP, `/`, `?`, and `#`. `HeaderField::validate` uses the receive rules. `HeaderField::validate_rfc9113` adds the authority userinfo ban (`@` in `:authority` or `host`) and the edge-whitespace rule. `nv!` does not validate, so constants such as `METHOD_POST` can be built in a const context. Validate before submit.
 
-**`RcBuf`.** `on_header_rcbuf` borrows name and value for the callback. `RcBuf::clone` (and `from_raw`) increments the native count; `Drop` decrements it once. `is_static` buffers ignore the count and live for the process. Dynamic buffers free when the last reference drops. The count is not atomic.
+**`RcBuf`.** `on_header_rcbuf` borrows name and value for the callback. `from_raw` acquires one native reference; Rust clones share that acquisition through `Rc`. The final Rust clone releases it. `is_static` buffers ignore native reference counting and live for the process. Dynamic buffers free when the last native reference drops. Custom allocator resources must outlive every retained buffer and its clones.
 
 **ALPN.** `types::select_next_protocol` reads a length-prefixed protocol list and prefers `h2` over `http/1.1`. `AlpnProtocol::Http2` and `AlpnProtocol::Http11` are the only successes. Oversized lists return `None` instead of wrapping the C parser's length arithmetic. `version_info()` reports the linked library's version and `proto_str`.
 
-**`CustomAllocator`.** `CustomAllocator::new` and `with_limit` install `malloc` / `free` / `calloc` / `realloc` over a boxed `nghttp2_mem`. The table and the tracking `State` are heap allocations, so moving the owner does not move the addresses nghttp2 stored. HPACK retains `context->mem` rather than copying the table; sessions do the same. Destroy every native user before dropping the allocator. `stats()` reports `live_bytes`, `peak_bytes`, `live_blocks`, and `failed_allocations` for the built-in tracker. Lowering the limit rejects later requests and does not free existing blocks. `from_raw` wraps an external table and does not account it. Pass `as_raw()` to `Session::client` / `Session::server` or to `HpDeflater::new_with_mem` / `HpInflater::new_with_mem`.
+**`CustomAllocator`.** `CustomAllocator::new` and `with_limit` install `malloc` / `free` / `calloc` / `realloc` over a boxed `nghttp2_mem`. The table and the tracking `State` are heap allocations, so moving the owner does not move the addresses nghttp2 stored. HPACK retains `context->mem` rather than copying the table; sessions do the same. Safe session constructors take ownership of `Option<CustomAllocator>` and release it after native session destruction. HPACK constructors and unsafe raw session constructors borrow the allocator, so those native users must be destroyed before it drops. `stats()` reports `live_bytes`, `peak_bytes`, `live_blocks`, and `failed_allocations` for the built-in tracker. Lowering the limit rejects later requests and does not free existing blocks. `from_raw` wraps an external table and does not account it. Pass `Some(allocator)` to `Session::client` / `Session::server`. Pass `allocator.as_raw()` to unsafe `HpDeflater::new_with_mem` / `HpInflater::new_with_mem`. The unsafe `client_with_raw_mem` / `server_with_raw_mem` constructors accept an optional raw table pointer and require the caller to keep the table and its resources alive.
 
 ## Usage
 
@@ -226,98 +226,88 @@ assert_eq!(allocator.stats().map(|stats| stats.live_blocks), Some(0));
 
 `new_with_mem` is unsafe because the caller keeps the table and its userdata alive until the native object is destroyed. The built-in `CustomAllocator` satisfies that as long as it is dropped last.
 
-Client and server sessions over memory. `mem_send` borrows the library buffer, so the chunk is copied before the peer consumes it. The server answers from `on_frame_recv` through `SessionCtx`, not through the outer `&mut Session`. The types in this sample are the wrapper contract; this crate does not export `Session`, `SessionHandler`, `EventCollector`, or `DataProvider` yet.
+Client and server sessions over memory. Each session owns its allocator. `mem_send` borrows the library buffer, so each chunk is copied before the peer consumes it. The server submits its response from `on_frame_recv` through `SessionCtx`.
 
 ```rust
-use nghttp2::callbacks::SessionHandler;
-use nghttp2::context::SessionCtx;
-use nghttp2::event::{EventCollector, SessionEvent};
-use nghttp2::mem::CustomAllocator;
-use nghttp2::nv::nv;
-use nghttp2::option::SessionOptions;
-use nghttp2::session::{ClientSession, Server, Session};
-use nghttp2::submit::DataProvider;
-use nghttp2::sys::nghttp2_frame;
+use nghttp2::callbacks::{CallbackError, CallbackResult, Frame};
+use nghttp2::{
+    ClientSession, CustomAllocator, DataProvider, EventCollector, Session,
+    SessionCtx, SessionEvent, SessionHandler, SessionOptions, Server, nv,
+};
 
 struct ServerApp;
 
 #[nghttp2_macros::nghttp2_callbacks]
 impl SessionHandler for ServerApp {
-    fn on_frame_recv(&mut self, ctx: &mut SessionCtx<'_>, frame: &nghttp2_frame) {
-        // `hd` is the common prefix of every union member.
-        let stream_id = unsafe { frame.hd.stream_id };
-        if stream_id == 0 {
-            return;
+    fn on_frame_recv(&mut self, ctx: &mut SessionCtx<'_>, frame: &Frame) -> CallbackResult {
+        // SAFETY: the frame header is the common prefix of every union member.
+        let header = unsafe { frame.hd };
+        if header.type_ == nghttp2::sys::NGHTTP2_HEADERS as u8 {
+            ctx.submit_response(
+                header.stream_id,
+                &[nv!(":status", "200")],
+                Some(DataProvider::from_vec(b"pong".to_vec())),
+            ).map_err(|_| CallbackError::Failure)?;
         }
-        let _ = ctx.submit_response(
-            stream_id,
-            &[nv!(":status", "200")],
-            Some(DataProvider::bytes(b"pong")),
-        );
+        Ok(())
     }
 }
 
-fn exchange() -> nghttp2::error::Result<()> {
-    let allocator = CustomAllocator::new();
-    let mut options = SessionOptions::new().map_err(nghttp2::error::Error::from_native)?;
-    options
-        .set_peer_max_concurrent_streams(100)
-        .set_no_auto_window_update(true);
-
+fn exchange() -> nghttp2::Result<()> {
+    let mut options = SessionOptions::new().map_err(nghttp2::Error::from_native)?;
+    options.set_peer_max_concurrent_streams(100);
     let mut client = ClientSession::client(
-        EventCollector::new(),
-        Some(&options),
-        Some(allocator.as_raw()),
+        EventCollector::new(), Some(&options), Some(CustomAllocator::new()),
     )?;
     let mut server = Session::<Server, ServerApp>::server(
-        ServerApp,
-        Some(&options),
-        Some(allocator.as_raw()),
+        ServerApp, Some(&options), Some(CustomAllocator::new()),
     )?;
-
-    let headers = [
-        nv!(":method", "POST"),
+    drop(options);
+    client.submit_settings(&[])?;
+    server.submit_settings(&[])?;
+    let stream_id = client.submit_request(&[
+        nv!(":method", "GET"),
         nv!(":scheme", "https"),
         nv!(":authority", "example.com"),
         nv!(":path", "/rpc"),
-        nv!("content-type", "application/grpc"),
-    ];
-    // `DataProvider::deferred` returns `submit::DEFERRED` until `resume_data`.
-    let stream_id = client.submit_request(&headers, Some(DataProvider::deferred()))?;
-    client.resume_data(stream_id)?;
-    client.submit_trailer(stream_id, &[nv!("grpc-status", "0")])?;
-    let priority = nghttp2::priority::ExtPri::new(0, true)
-        .map_err(nghttp2::error::Error::from_native)?;
-    client.submit_priority_update(stream_id, priority)?;
+    ], None)?;
 
-    let mut forward = Vec::new();
-    while client.want_write() {
-        let chunk = client.mem_send()?;
-        if chunk.is_empty() {
-            break;
+    loop {
+        let mut progressed = false;
+        loop {
+            let wire = client.mem_send()?.to_vec();
+            if wire.is_empty() { break; }
+            assert_eq!(server.mem_recv(&wire)?, wire.len());
+            progressed = true;
         }
-        forward.extend_from_slice(chunk);
-    }
-    server.mem_recv(&forward)?;
-
-    forward.clear();
-    while server.want_write() {
-        let chunk = server.mem_send()?;
-        if chunk.is_empty() {
-            break;
+        loop {
+            let wire = server.mem_send()?.to_vec();
+            if wire.is_empty() { break; }
+            assert_eq!(client.mem_recv(&wire)?, wire.len());
+            progressed = true;
         }
-        forward.extend_from_slice(chunk);
+        if !progressed { break; }
     }
-    client.mem_recv(&forward)?;
 
+    let mut response = Vec::new();
+    let mut closed = false;
     while let Some(event) = client.next_event() {
-        if let SessionEvent::DataChunk { data, .. } = event {
-            assert_eq!(data, b"pong");
+        match event {
+            SessionEvent::DataChunk { stream_id: id, data, .. } if id == stream_id => {
+                response.extend_from_slice(&data);
+            }
+            SessionEvent::StreamClose { stream_id: id, .. } if id == stream_id => {
+                closed = true;
+            }
+            _ => {}
         }
     }
-    client.consume(stream_id, 4)?;
+    assert_eq!(response, b"pong");
+    assert!(closed);
     Ok(())
 }
+
+exchange().expect("HTTP/2 exchange");
 ```
 
 `submit::DEFERRED` (`NGHTTP2_ERR_DEFERRED`) pauses a provider. `Error::kind` reports `ErrorKind::Temporal` for `WOULDBLOCK`, `DEFERRED`, and `PAUSE`. Codes strictly below `NGHTTP2_ERR_FATAL` are `ErrorKind::Fatal`; drop that session.
