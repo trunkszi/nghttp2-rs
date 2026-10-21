@@ -118,12 +118,18 @@ fn bind(
 ) -> Result<()> {
     if let Some((slot, _)) = retained {
         let store = sources(raw)?;
-        let mut store = store.try_borrow_mut().map_err(|_| invalid_state())?;
-        store
-            .entries
-            .get_mut(*slot)
-            .ok_or_else(invalid_state)?
-            .stream = stream;
+        let rejected = {
+            let mut store = store.try_borrow_mut().map_err(|_| invalid_state())?;
+            let entry = store.entries.get_mut(*slot).ok_or_else(invalid_state)?;
+            entry.stream = stream;
+            if stream.is_none() {
+                Some(store.entries.remove(*slot))
+            } else {
+                None
+            }
+        };
+        // User source destructors run after releasing the retention-table borrow.
+        drop(rejected);
     }
     Ok(())
 }
@@ -134,12 +140,28 @@ fn descriptor(
         .as_ref()
         .map_or(ptr::null(), |(_, raw)| ptr::from_ref(raw))
 }
-fn outcome(code: i32) -> Result<i32> {
-    if code < 0 {
-        Err(Error::from_native(code))
-    } else {
-        Ok(code)
+fn classified<T>(raw: *mut RawSession, result: Result<T>) -> Result<T> {
+    if let Err(error) = &result
+        && error.is_fatal()
+    {
+        let store = sources(raw)?;
+        store
+            .try_borrow_mut()
+            .map_err(|_| invalid_state())?
+            .failure
+            .get_or_insert(*error);
     }
+    result
+}
+fn outcome(raw: *mut RawSession, code: i32) -> Result<i32> {
+    classified(
+        raw,
+        if code < 0 {
+            Err(Error::from_native(code))
+        } else {
+            Ok(code)
+        },
+    )
 }
 
 /// Owns native state, callback storage, DATA sources and an optional allocator.
@@ -421,7 +443,8 @@ fn with_pointer<T>(
     let raw = live(raw)?;
     // SAFETY: the owning session/context keeps native state live on this thread through operation.
     let handle = unsafe { crate::context::SessionPtr::from_raw(raw) };
-    operation(&handle)
+    let result = operation(&handle);
+    classified(raw.as_ptr(), result)
 }
 macro_rules! forward {
     ($name:ident($($param:ident: $ty:ty),*) -> $out:ty; $($arg:expr),*) => {
@@ -452,7 +475,7 @@ macro_rules! session_api {
             let fields = headers(fields);
             let retained = retain(self.raw(), body)?;
             // SAFETY: NO_COPY flags are cleared; nghttp2 copies headers/descriptor, and the source is already retained.
-            let result = outcome(unsafe { ffi::nghttp2_submit_request2(self.raw(), ptr::null(), fields.as_ptr(), fields.len(), descriptor(&retained), ptr::null_mut()) });
+            let result = outcome(self.raw(), unsafe { ffi::nghttp2_submit_request2(self.raw(), ptr::null(), fields.as_ptr(), fields.len(), descriptor(&retained), ptr::null_mut()) });
             bind(self.raw(), &retained, match result { Ok(id) => Some(id), Err(_) => None })?;
             result
         }
@@ -464,7 +487,7 @@ macro_rules! session_api {
             let fields = headers(fields);
             let retained = retain(self.raw(), body)?;
             // SAFETY: header bytes are copied and the source allocation is retained before native acceptance.
-            let result = outcome(unsafe { ffi::nghttp2_submit_response2(self.raw(), stream_id, fields.as_ptr(), fields.len(), descriptor(&retained)) });
+            let result = outcome(self.raw(), unsafe { ffi::nghttp2_submit_response2(self.raw(), stream_id, fields.as_ptr(), fields.len(), descriptor(&retained)) });
             bind(self.raw(), &retained, result.as_ref().map(|_| stream_id).ok())?;
             result.map(|_| ())
         }
@@ -475,7 +498,7 @@ macro_rules! session_api {
             live(self.raw())?;
             let fields = headers(fields);
             // SAFETY: the native call copies every header, and no borrowed bytes are retained.
-            outcome(unsafe { ffi::nghttp2_submit_headers(self.raw(), flags, stream_id, ptr::null(), fields.as_ptr(), fields.len(), ptr::null_mut()) })
+            outcome(self.raw(), unsafe { ffi::nghttp2_submit_headers(self.raw(), flags, stream_id, ptr::null(), fields.as_ptr(), fields.len(), ptr::null_mut()) })
         }
         /// Queues DATA and retains its source across deferred/native callbacks.
         /// # Errors
@@ -484,7 +507,7 @@ macro_rules! session_api {
             live(self.raw())?;
             let retained = retain(self.raw(), Some(provider))?;
             // SAFETY: the source is retained and nghttp2 copies the local native descriptor.
-            let result = outcome(unsafe { ffi::nghttp2_submit_data2(self.raw(), flags, stream_id, descriptor(&retained)) });
+            let result = outcome(self.raw(), unsafe { ffi::nghttp2_submit_data2(self.raw(), flags, stream_id, descriptor(&retained)) });
             bind(self.raw(), &retained, result.as_ref().map(|_| stream_id).ok())?;
             result.map(|_| ())
         }
@@ -495,7 +518,7 @@ macro_rules! session_api {
             live(self.raw())?;
             let fields = headers(fields);
             // SAFETY: all fields are copied by the native submission before caller buffers expire.
-            outcome(unsafe { ffi::nghttp2_submit_trailer(self.raw(), stream_id, fields.as_ptr(), fields.len()) }).map(|_| ())
+            outcome(self.raw(), unsafe { ffi::nghttp2_submit_trailer(self.raw(), stream_id, fields.as_ptr(), fields.len()) }).map(|_| ())
         }
         forward!(submit_rst_stream(stream_id: i32, error_code: u32) -> (); FrameFlags::NONE, stream_id, ErrorCode::from_raw(error_code));
         forward!(submit_settings(entries: &[SettingsEntry]) -> (); entries);

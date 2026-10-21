@@ -192,6 +192,7 @@ fn integration_lifecycle_scenario_deferred_owned_provider_resumes_and_drops_once
     );
     server.submit_response(stream, &[nv!(":status", "204")], None)?;
     pump(&mut client, &mut server)?;
+    assert_eq!(dropped.get(), 1, "closed stream retained its source");
     drop(client);
     assert_eq!(dropped.get(), 1);
     Ok(())
@@ -387,6 +388,11 @@ fn assert_panic<R, H: SessionHandler>(session: &mut Session<R, H>, message: &str
     };
     assert_eq!(payload.downcast_ref::<&str>().copied(), Some(message));
     assert!(session.take_panic().is_none());
+    assert_eq!(session.mem_recv(&[]), Err(Error::CallbackPanicked));
+    assert_eq!(session.mem_send(), Err(Error::CallbackPanicked));
+    assert_eq!(session.send(), Err(Error::CallbackPanicked));
+    assert_eq!(session.recv(), Err(Error::CallbackPanicked));
+    assert_eq!(session.submit_settings(&[]), Err(Error::CallbackPanicked));
 }
 
 #[test]
@@ -615,5 +621,172 @@ fn integration_lifecycle_owned_no_copy_provider_sends_native_data_frames() -> Re
         body(&server.drain_events().collect::<Vec<_>>(), stream),
         payload
     );
+    Ok(())
+}
+
+fn tracked_source(dropped: &Rc<Cell<usize>>, ready: bool) -> DataProvider {
+    DataProvider::new(Source {
+        bytes: b"owned-source".to_vec(),
+        ready: Rc::new(Cell::new(ready)),
+        sent: false,
+        dropped: dropped.clone(),
+    })
+}
+
+#[test]
+fn integration_lifecycle_scenario_rejected_sources_are_released_without_another_drive() -> Result<()>
+{
+    let mut client = ClientSession::new_default(None, None)?;
+    let dropped = Rc::new(Cell::new(0));
+    for count in 1..=4 {
+        assert!(
+            client
+                .submit_data(0, 0, tracked_source(&dropped, true))
+                .is_err()
+        );
+        assert_eq!(dropped.get(), count, "native rejection retained source");
+    }
+    drop(client);
+    assert_eq!(dropped.get(), 4);
+    let mut server = ServerSession::new_default(None, None)?;
+    assert!(
+        server
+            .submit_request(&request(), Some(tracked_source(&dropped, true)))
+            .is_err()
+    );
+    assert_eq!(dropped.get(), 5, "rejected request retained source");
+    assert!(
+        server
+            .submit_response(
+                0,
+                &[nv!(":status", "200")],
+                Some(tracked_source(&dropped, true))
+            )
+            .is_err()
+    );
+    assert_eq!(dropped.get(), 6, "rejected response retained source");
+    Ok(())
+}
+
+#[test]
+fn integration_lifecycle_scenario_sessions_with_matching_stream_ids_release_only_their_sources()
+-> Result<()> {
+    let (mut first, mut peer) = pair()?;
+    let (mut other, mut other_peer) = pair()?;
+    let first_dropped = Rc::new(Cell::new(0));
+    let other_dropped = Rc::new(Cell::new(0));
+    let stream = first.submit_request(&request(), Some(tracked_source(&first_dropped, false)))?;
+    assert_eq!(
+        other.submit_request(&request(), Some(tracked_source(&other_dropped, false)))?,
+        stream
+    );
+    pump(&mut first, &mut peer)?;
+    pump(&mut other, &mut other_peer)?;
+    first.submit_rst_stream(stream, ErrorCode::CANCEL.raw())?;
+    pump(&mut first, &mut peer)?;
+    assert_eq!(first_dropped.get(), 1);
+    assert_eq!(other_dropped.get(), 0);
+    assert!(other.find_stream(stream).is_some());
+    drop(first);
+    assert_eq!(other_dropped.get(), 0);
+    drop(other);
+    assert_eq!(other_dropped.get(), 1);
+    Ok(())
+}
+
+struct ContextData {
+    submitted: Option<Result<()>>,
+    panic: bool,
+}
+
+impl SessionHandler for ContextData {
+    fn on_frame_recv(&mut self, ctx: &mut SessionCtx<'_>, frame: &Frame) -> CallbackResult {
+        // SAFETY: every native frame union variant starts with its common header.
+        let hd = unsafe { frame.hd };
+        if hd.type_ != FrameType::HEADERS.raw() {
+            return Ok(());
+        }
+        assert_eq!(
+            ctx.find_stream(hd.stream_id).map(|stream| stream.id()),
+            Some(hd.stream_id)
+        );
+        assert_eq!(ctx.root_stream().id(), 0);
+        assert!(ctx.remote_window_size() > 0);
+        assert!(ctx.stream_remote_window_size(hd.stream_id) > 0);
+        let value = b"200".to_vec();
+        let fields = [HeaderField::from_static(
+            b":status",
+            &value,
+            NvFlags::NO_COPY,
+        )];
+        let result = ctx.submit_headers(0, hd.stream_id, &fields).and_then(|_| {
+            let source = if self.panic {
+                DataProvider::new(PanicSource)
+            } else {
+                DataProvider::from_vec(b"context-data".to_vec())
+            };
+            ctx.submit_data(FrameFlags::END_STREAM.bits(), hd.stream_id, source)
+        });
+        self.submitted = Some(result);
+        Ok(())
+    }
+}
+
+#[test]
+fn integration_scenario_callback_owned_data_uses_the_owning_sessions_panic_and_lifetime_state()
+-> Result<()> {
+    for panics in [false, true] {
+        let mut client = ClientSession::new_default(None, None)?;
+        let mut server = Session::server(
+            ContextData {
+                submitted: None,
+                panic: panics,
+            },
+            None,
+            None,
+        )?;
+        client.submit_settings(&[])?;
+        server.submit_settings(&[])?;
+        let stream = client.submit_request(&request(), None)?;
+        transfer(&mut client, &mut server)?;
+        assert_eq!(server.handler().submitted, Some(Ok(())));
+        let result = transfer(&mut server, &mut client);
+        if panics {
+            assert_eq!(result, Err(Error::CallbackPanicked));
+            assert_panic(&mut server, "provider panic");
+        } else {
+            result?;
+            let events: Vec<_> = client.drain_events().collect();
+            assert!(has_header(&events, stream, b":status", b"200"));
+            assert_eq!(body(&events, stream), b"context-data");
+        }
+    }
+    Ok(())
+}
+
+#[test]
+fn integration_scenario_submission_oom_remains_fatal_after_allocator_recovers() -> Result<()> {
+    let allocator = CustomAllocator::new();
+    let raw = std::ptr::from_ref(allocator.as_raw()).cast_mut();
+    // SAFETY: allocator and its callback state outlive the session and its deletion.
+    let mut client =
+        unsafe { Session::client_with_raw_mem(EventCollector::new(), None, Some(raw)) }?;
+    assert!(allocator.set_limit(0));
+    let error = client
+        .submit_ping(false, None)
+        .expect_err("PING allocation must fail");
+    assert_eq!(error, Error::from_native(sys::NGHTTP2_ERR_NOMEM));
+    assert!(allocator.set_limit(usize::MAX));
+    assert_eq!(client.submit_ping(false, None), Err(error));
+    assert_eq!(client.mem_send(), Err(error));
+    assert_eq!(client.mem_recv(&[]), Err(error));
+    assert_eq!(client.send(), Err(error));
+    assert_eq!(client.recv(), Err(error));
+    drop(client);
+    let Some(stats) = allocator.stats() else {
+        panic!("tracked allocator lost counters")
+    };
+    assert_eq!(stats.live_blocks, 0);
+    assert_eq!(stats.live_bytes, 0);
     Ok(())
 }
