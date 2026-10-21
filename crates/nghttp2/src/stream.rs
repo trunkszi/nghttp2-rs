@@ -233,7 +233,8 @@ mod tests {
         NGHTTP2_DEFAULT_WEIGHT, nghttp2_nv, nghttp2_session, nghttp2_session_callbacks,
         nghttp2_session_callbacks_del, nghttp2_session_callbacks_new, nghttp2_session_client_new,
         nghttp2_session_del, nghttp2_session_mem_recv2, nghttp2_session_mem_send2,
-        nghttp2_session_server_new, nghttp2_submit_request2, nghttp2_submit_settings,
+        nghttp2_session_server_new, nghttp2_submit_request2, nghttp2_submit_rst_stream,
+        nghttp2_submit_settings,
     };
 
     use super::*;
@@ -494,6 +495,50 @@ mod tests {
         };
         assert_eq!(root.id(), 0);
         assert_eq!(Some(root), handle.root_stream());
+    }
+
+    #[test]
+    fn repeated_lookups_of_one_stream_compare_equal() {
+        let session = TestSession::client();
+        let handle = session.handle();
+        let first = session.submit_request();
+        let second = session.submit_request();
+        let _bytes = session.send_bytes();
+
+        let Some(a) = handle.find_stream(first) else {
+            panic!("stream {first} missing after send");
+        };
+        let Some(b) = handle.find_stream(first) else {
+            panic!("stream {first} missing after send");
+        };
+        let Some(other) = handle.find_stream(second) else {
+            panic!("stream {second} missing after send");
+        };
+        assert_eq!(a, b, "two lookups of one id must compare equal");
+        assert_ne!(a, other);
+    }
+
+    #[test]
+    fn closed_streams_are_removed_from_the_lookup() {
+        let session = TestSession::client();
+        let handle = session.handle();
+        let stream_id = session.submit_request();
+        let _bytes = session.send_bytes();
+        assert!(
+            handle.find_stream(stream_id).is_some(),
+            "stream {stream_id} missing after its HEADERS was sent"
+        );
+
+        // A sent RST_STREAM reaches nghttp2_session_close_stream, which destroys the
+        // stream and removes it from the session map that find_stream consults.
+        // SAFETY: the session is live and the id was returned by submit_request.
+        let rv = unsafe { nghttp2_submit_rst_stream(session.session, 0, stream_id, 0) };
+        assert_eq!(rv, 0, "nghttp2_submit_rst_stream failed: {rv}");
+        let _bytes = session.send_bytes();
+        assert!(
+            handle.find_stream(stream_id).is_none(),
+            "closed stream {stream_id} is still visible"
+        );
     }
 
     #[test]
