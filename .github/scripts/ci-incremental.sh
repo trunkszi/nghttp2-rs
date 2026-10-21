@@ -25,12 +25,11 @@ else
 fi
 
 if [ -z "$changed_files" ]; then
-  echo "==> No files changed between $BASE_SHA and HEAD."
-  exit 0
+  echo "==> No files changed between $BASE_SHA and HEAD; running full-tree invariants."
+else
+  echo "==> Changed files:"
+  echo "$changed_files" | sed 's/^/  - /'
 fi
-
-echo "==> Changed files:"
-echo "$changed_files" | sed 's/^/  - /'
 
 # 1. Enforce <= 800 line limit on all tracked .rs, .c, .cpp, .h, .hpp files.
 echo "==> Checking <= 800 line limit on source files (.rs, .c, .cpp, .h, .hpp)..."
@@ -56,16 +55,57 @@ if [ "$line_violations" -gt 0 ]; then
 fi
 
 # 2. Enforce zero async runtime dependencies across all Cargo.toml manifests.
-async_names='(tokio|futures|futures-core|futures-util|async-std|smol)'
-dependency_key="[\"']?${async_names}[\"']?"
-while IFS= read -r manifest; do
-  [ -z "$manifest" ] && continue
-  [ -f "$manifest" ] || continue
-  if grep -Eq "^[[:space:]]*(${dependency_key}[[:space:]]*(=|\.)|[^=#]*dependencies[[:space:]]*\.[[:space:]]*${dependency_key}[[:space:]]*(=|\.)|\[[^]#]*dependencies[[:space:]]*\.[[:space:]]*${dependency_key}[[:space:]]*(\.|\]))" "$manifest"; then
-    echo "::error file=$manifest::Forbidden async runtime dependency detected in $manifest"
-    exit 1
-  fi
-done < <(git ls-files '*Cargo.toml')
+#    Parse the manifests instead of matching names: this catches prefixed crates
+#    (tokio-util, futures-executor, async-*) and renamed dependencies
+#    (`foo = { package = "tokio" }`).
+echo "==> Checking for async runtime dependencies..."
+python3 - <<'PY'
+import subprocess
+import sys
+import tomllib
+
+FORBIDDEN_PREFIXES = ("tokio", "futures", "async", "smol")
+
+
+def forbidden(name):
+    return name.startswith(FORBIDDEN_PREFIXES)
+
+
+manifests = subprocess.check_output(
+    ["git", "ls-files", "*Cargo.toml"], text=True
+).split()
+violations = []
+for path in manifests:
+    try:
+        with open(path, "rb") as handle:
+            document = tomllib.load(handle)
+    except (OSError, tomllib.TOMLDecodeError) as error:
+        sys.exit(f"::error file={path}::cannot parse Cargo.toml: {error}")
+
+    def visit(table):
+        for key, value in table.items():
+            if key.endswith("dependencies") and isinstance(value, dict):
+                for name, spec in value.items():
+                    package = spec.get("package", name) if isinstance(spec, dict) else name
+                    if forbidden(name) or forbidden(package):
+                        violations.append((path, name, package))
+            elif isinstance(value, dict):
+                visit(value)
+
+    visit(document)
+
+if violations:
+    for path, name, package in violations:
+        print(
+            f"::error file={path}::forbidden async dependency {name} (crate {package})"
+        )
+    sys.exit(1)
+print(f"==> async dependency check: {len(manifests)} manifests clean")
+PY
+
+if [ -z "$changed_files" ]; then
+  exit 0
+fi
 
 # 3. If the root Cargo.toml does not exist yet, exit cleanly.
 if [ ! -f Cargo.toml ]; then
@@ -75,6 +115,10 @@ fi
 
 # 4. Determine affected workspace crates from changed files.
 run_all_crates=0
+# A scheduled run must exercise every package, not only the last commit's diff.
+if [ "${GITHUB_EVENT_NAME:-}" = "schedule" ]; then
+  run_all_crates=1
+fi
 declare -A affected_map=()
 
 while IFS= read -r file; do
@@ -161,5 +205,12 @@ for pkg in "${selected_pkgs[@]}"; do
   echo "==> [doctest] package: $pkg"
   cargo test --doc -p "$pkg"
 done
+
+# The default matrix builds `pre-release`; exercise the stable resolution on
+# full runs so the second feature path cannot rot silently.
+if [ "$run_all_crates" -eq 1 ]; then
+  echo "==> [stable] nghttp2-sys"
+  cargo test -p nghttp2-sys --no-default-features --features stable
+fi
 
 echo "==> Incremental CI succeeded for: ${selected_pkgs[*]}"

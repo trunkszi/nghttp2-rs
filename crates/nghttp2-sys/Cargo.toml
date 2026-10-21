@@ -9,8 +9,9 @@ description = "Static CMake build and complete FFI declarations for upstream ngh
 links = "nghttp2"
 
 [lib]
-# Upstream doc comments contain indented C examples that rustdoc would run as
-# Rust doctests.
+# The assembled declarations intentionally carry no doc comments. Doctests stay
+# disabled so regenerated bindings that include upstream docs cannot turn their
+# indented C examples into Rust doctests.
 doctest = false
 
 [features]
