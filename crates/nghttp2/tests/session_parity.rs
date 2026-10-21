@@ -232,6 +232,7 @@ fn integration_lifecycle_grpc_request_response_trailers_have_exact_receive_order
 
 #[derive(Default)]
 struct Respond {
+    pending: usize,
     consumed: usize,
     submitted: usize,
 }
@@ -239,19 +240,23 @@ struct Respond {
 impl SessionHandler for Respond {
     fn on_data_chunk_recv(
         &mut self,
-        ctx: &mut SessionCtx<'_>,
+        _: &mut SessionCtx<'_>,
         _: u8,
-        stream: i32,
+        _: i32,
         data: &[u8],
     ) -> CallbackResult {
-        ctx.consume(stream, data.len())
-            .map_err(|_| CallbackError::Failure)?;
-        self.consumed += data.len();
+        self.pending += data.len();
         Ok(())
     }
     fn on_frame_recv(&mut self, ctx: &mut SessionCtx<'_>, frame: &Frame) -> CallbackResult {
         // SAFETY: every native union member begins with the initialized common header.
         let hd = unsafe { frame.hd };
+        if hd.type_ == FrameType::DATA.raw() {
+            let bytes = std::mem::take(&mut self.pending);
+            ctx.consume(hd.stream_id, bytes)
+                .map_err(|_| CallbackError::Failure)?;
+            self.consumed += bytes;
+        }
         if hd.stream_id != 0 && hd.flags & FrameFlags::END_STREAM.bits() != 0 {
             assert_eq!(
                 ctx.find_stream(hd.stream_id).map(|s| s.id()),
@@ -473,7 +478,13 @@ fn integration_scenario_manual_consumption_restores_exhausted_connection_and_str
     Ok(())
 }
 
-fn frames(wire: &[u8]) -> Vec<(u8, u8, i32, Vec<u8>)> {
+struct WireFrame {
+    kind: u8,
+    flags: u8,
+    stream: i32,
+    payload: Vec<u8>,
+}
+fn frames(wire: &[u8]) -> Vec<WireFrame> {
     let mut frames = Vec::new();
     let mut offset = 0;
     while offset < wire.len() {
@@ -482,7 +493,12 @@ fn frames(wire: &[u8]) -> Vec<(u8, u8, i32, Vec<u8>)> {
         let len = (usize::from(h[0]) << 16) | (usize::from(h[1]) << 8) | usize::from(h[2]);
         let stream = i32::from_be_bytes(h[5..9].try_into().unwrap()) & 0x7fff_ffff;
         offset += 9;
-        frames.push((h[3], h[4], stream, wire[offset..offset + len].to_vec()));
+        frames.push(WireFrame {
+            kind: h[3],
+            flags: h[4],
+            stream,
+            payload: wire[offset..offset + len].to_vec(),
+        });
         offset += len;
     }
     frames
@@ -542,15 +558,16 @@ fn integration_scenario_control_and_extension_frames_cross_the_wire() -> Result<
     pump(&mut client, &mut server)?;
     client.submit_priority_update(stream, ExtPri::new(1, true).map_err(Error::from_native)?)?;
     let priority_wire = frames(&transfer(&mut client, &mut server)?);
-    assert!(priority_wire.iter().any(|(kind, _, id, bytes)| *kind
-        == FrameType::PRIORITY_UPDATE.raw()
-        && *id == 0
-        && bytes[..4] == stream.to_be_bytes()
-        && &bytes[4..] == b"u=1, i=?1"));
+    assert!(
+        priority_wire
+            .iter()
+            .any(|f| f.kind == FrameType::PRIORITY_UPDATE.raw()
+                && f.flags == 0
+                && f.stream == 0
+                && f.payload[..4] == stream.to_be_bytes()
+                && &f.payload[4..] == b"u=1, i=?1")
+    );
     assert!(server.handler().changed);
-    // SAFETY: this pointer is borrowed from the active callback context nowhere; use a
-    // callback-safe public read through the stream is insufficient to expose urgency, so verify
-    // later wire behavior.
     let priority_events: Vec<_> =
         std::iter::from_fn(|| server.handler_mut().events.next_event()).collect();
     assert!(priority_events.iter().any(|e| matches!(e, SessionEvent::FrameRecv { frame_type, .. } if *frame_type == FrameType::PRIORITY_UPDATE)));
@@ -558,24 +575,38 @@ fn integration_scenario_control_and_extension_frames_cross_the_wire() -> Result<
     server.submit_altsvc(0, b"https://example.com", b"h2=\":443\"")?;
     server.submit_origin(&[b"https://example.com", b"https://other.example"])?;
     let wire = frames(&transfer(&mut server, &mut client)?);
-    assert!(
-        wire.iter()
-            .any(|(kind, _, _, bytes)| *kind == FrameType::PING.raw() && bytes == b"ping-123")
-    );
+    assert!(wire.iter().any(|f| f.kind == FrameType::PING.raw()
+        && f.flags == 0
+        && f.stream == 0
+        && f.payload == b"ping-123"));
     let alt = wire
         .iter()
-        .find(|f| f.0 == FrameType::ALTSVC.raw())
+        .find(|f| f.kind == FrameType::ALTSVC.raw())
         .expect("ALTSVC on wire");
-    assert_eq!(&alt.3[2..], b"https://example.comh2=\":443\"");
+    assert_eq!((alt.flags, alt.stream), (0, 0));
+    assert_eq!(
+        alt.payload,
+        [
+            b"\x00\x13".as_slice(),
+            b"https://example.com",
+            b"h2=\":443\""
+        ]
+        .concat()
+    );
     let origin = wire
         .iter()
-        .find(|f| f.0 == FrameType::ORIGIN.raw())
+        .find(|f| f.kind == FrameType::ORIGIN.raw())
         .expect("ORIGIN on wire");
-    assert!(
-        origin
-            .3
-            .windows(b"https://example.com".len())
-            .any(|b| b == b"https://example.com")
+    assert_eq!((origin.flags, origin.stream), (0, 0));
+    assert_eq!(
+        origin.payload,
+        [
+            b"\x00\x13".as_slice(),
+            b"https://example.com",
+            b"\x00\x15",
+            b"https://other.example"
+        ]
+        .concat()
     );
     let events: Vec<_> = client.drain_events().collect();
     for kind in [FrameType::ALTSVC, FrameType::ORIGIN] {
@@ -599,9 +630,9 @@ fn integration_scenario_control_and_extension_frames_cross_the_wire() -> Result<
     pump(&mut client, &mut server)?;
     client.submit_rst_stream(stream, ErrorCode::CANCEL.raw())?;
     let rst = frames(&transfer(&mut client, &mut server)?);
-    assert!(rst.iter().any(|f| f.0 == FrameType::RST_STREAM.raw()
-        && f.2 == stream
-        && f.3 == ErrorCode::CANCEL.raw().to_be_bytes()));
+    assert!(rst.iter().any(|f| f.kind == FrameType::RST_STREAM.raw()
+        && f.stream == stream
+        && f.payload == ErrorCode::CANCEL.raw().to_be_bytes()));
     assert!(
         std::iter::from_fn(|| server.handler_mut().events.next_event()).any(|e| e
             == SessionEvent::StreamClose {
@@ -617,7 +648,7 @@ fn integration_scenario_control_and_extension_frames_cross_the_wire() -> Result<
     assert!(
         goaway
             .iter()
-            .any(|f| f.0 == FrameType::GOAWAY.raw() && f.3.ends_with(b"finished"))
+            .any(|f| f.kind == FrameType::GOAWAY.raw() && f.payload.ends_with(b"finished"))
     );
     assert!(client.drain_events().any(|e| e
         == SessionEvent::GoAway {
