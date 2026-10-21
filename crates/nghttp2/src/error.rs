@@ -28,7 +28,7 @@ pub type RawErrorCode = nghttp2_error;
 pub type RawStreamError = nghttp2_error_code;
 
 /// Result type used by every fallible operation in this crate.
-pub type Result<T> = core::result::Result<T, Error>;
+pub type Result<T> = std::result::Result<T, Error>;
 
 /// Returns whether a native error code makes the session unusable.
 ///
@@ -168,9 +168,12 @@ impl Error {
     }
 
     /// Returns whether this error leaves the session unusable.
+    ///
+    /// Both native fatal errors and caught callback panics require the session to
+    /// be discarded; [`Error::kind`] still distinguishes the two cases.
     #[must_use]
     pub fn is_fatal(self) -> bool {
-        self.kind() == ErrorKind::Fatal
+        matches!(self.kind(), ErrorKind::Fatal | ErrorKind::CallbackPanicked)
     }
 
     /// Returns whether the caller must retry the same operation later.
@@ -223,8 +226,9 @@ impl From<RawErrorCode> for Error {
 #[cfg(test)]
 mod tests {
     use nghttp2_sys::{
-        NGHTTP2_CANCEL, NGHTTP2_ERR_CALLBACK_FAILURE, NGHTTP2_ERR_FLOODED,
-        NGHTTP2_ERR_INVALID_ARGUMENT, NGHTTP2_ERR_NOMEM, NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE,
+        NGHTTP2_CANCEL, NGHTTP2_ERR_CALLBACK_FAILURE, NGHTTP2_ERR_DEFERRED_DATA_EXIST,
+        NGHTTP2_ERR_FLOODED, NGHTTP2_ERR_INVALID_ARGUMENT, NGHTTP2_ERR_NOMEM,
+        NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE, NGHTTP2_ERR_TOO_MANY_CONTINUATIONS,
     };
 
     use super::*;
@@ -293,6 +297,8 @@ mod tests {
         assert!(NgHttp2Error::from_raw(NGHTTP2_ERR_NOMEM).is_fatal());
         assert!(NgHttp2Error::from_raw(NGHTTP2_ERR_CALLBACK_FAILURE).is_fatal());
         assert!(NgHttp2Error::from_raw(NGHTTP2_ERR_FLOODED).is_fatal());
+        // Beyond the codes used by today's tests: a range check must still be fatal.
+        assert!(NgHttp2Error::from_raw(NGHTTP2_ERR_TOO_MANY_CONTINUATIONS).is_fatal());
     }
 
     #[test]
@@ -302,6 +308,8 @@ mod tests {
         assert!(NgHttp2Error::from_raw(NGHTTP2_ERR_PAUSE).is_temporal());
         assert!(!NgHttp2Error::from_raw(NGHTTP2_ERR_INVALID_ARGUMENT).is_temporal());
         assert!(!NgHttp2Error::from_raw(NGHTTP2_ERR_TEMPORAL_CALLBACK_FAILURE).is_temporal());
+        // A code whose name contains DEFERRED is not one of the retryable states.
+        assert!(!NgHttp2Error::from_raw(NGHTTP2_ERR_DEFERRED_DATA_EXIST).is_temporal());
     }
 
     #[test]
@@ -377,7 +385,8 @@ mod tests {
     fn callback_panics_have_their_own_kind() {
         let error = Error::CallbackPanicked;
         assert_eq!(error.kind(), ErrorKind::CallbackPanicked);
-        assert!(!error.is_fatal());
+        // The session is unusable after a panic even though the kind is not `Fatal`.
+        assert!(error.is_fatal());
         assert!(!error.is_temporal());
         assert!(error.message().contains("panicked"));
         assert!(error.message().contains("discarded"));
@@ -400,13 +409,23 @@ mod tests {
 
     #[test]
     fn from_conversions_build_the_matching_variant() {
-        let native = NgHttp2Error::from_raw(NGHTTP2_ERR_INVALID_ARGUMENT);
-        assert_eq!(Error::from(native), Error::from_native(-501));
-        assert_eq!(Error::from(-501), Error::from_native(-501));
+        let native = Error::from(NgHttp2Error::from_raw(NGHTTP2_ERR_INVALID_ARGUMENT));
+        let Error::Native(inner) = native else {
+            panic!("expected a native error, got {native:?}");
+        };
+        assert_eq!(inner.raw(), NGHTTP2_ERR_INVALID_ARGUMENT);
 
-        let stream = ErrorCode::from_raw(NGHTTP2_CANCEL);
-        assert_eq!(Error::from(stream), Error::from_stream(stream));
-        assert_eq!(Error::from(stream), Error::Stream(stream));
+        let stream = Error::from(ErrorCode::from_raw(NGHTTP2_CANCEL));
+        let Error::Stream(inner) = stream else {
+            panic!("expected a stream error, got {stream:?}");
+        };
+        assert_eq!(inner.raw(), NGHTTP2_CANCEL);
+
+        let raw = Error::from(NGHTTP2_ERR_NOMEM);
+        let Error::Native(inner) = raw else {
+            panic!("expected a native error, got {raw:?}");
+        };
+        assert_eq!(inner.raw(), NGHTTP2_ERR_NOMEM);
     }
 
     #[test]
@@ -417,5 +436,20 @@ mod tests {
         assert_std_error(&Error::from_native(NGHTTP2_ERR_INVALID_ARGUMENT));
         assert_std_error(&Error::from_stream(ErrorCode::from_raw(NGHTTP2_CANCEL)));
         assert_std_error(&Error::CallbackPanicked);
+    }
+
+    #[test]
+    fn unknown_fatal_codes_are_classified_by_threshold() {
+        // -1000 is below the fatal boundary even though nghttp2 does not define it.
+        let error = Error::from_native(-1000);
+        assert_eq!(error.kind(), ErrorKind::Fatal);
+        assert!(error.is_fatal());
+        assert!(!error.is_temporal());
+        assert_eq!(error.message(), "Unknown error code");
+    }
+
+    #[test]
+    fn pause_is_temporal_at_the_error_level() {
+        assert!(Error::from_native(NGHTTP2_ERR_PAUSE).is_temporal());
     }
 }
