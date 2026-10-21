@@ -1,10 +1,11 @@
 //! HTTP/2 integration scenarios over native sessions and an in-memory transport.
 use std::{cell::Cell, rc::Rc};
 
+use anyhow::{Context, Result, bail};
 use nghttp2::{
     Client, ClientSession, CustomAllocator, DataPoll, DataProvider, DataSource, Error, ErrorCode,
-    EventCollector, ExtPri, FrameFlags, FrameType, HeaderField, Result, Server, ServerSession,
-    Session, SessionCtx, SessionEvent, SessionHandler, SessionOptions, SettingsEntry, SettingsId,
+    EventCollector, ExtPri, FrameFlags, FrameType, HeaderField, Server, ServerSession, Session,
+    SessionCtx, SessionEvent, SessionHandler, SessionOptions, SettingsEntry, SettingsId,
     callbacks::{CallbackError, CallbackResult, Frame},
     nv, sys,
     types::HeadersCategory,
@@ -26,14 +27,14 @@ fn transfer<R, H: SessionHandler, S, G: SessionHandler>(
 ) -> Result<Vec<u8>> {
     let mut wire = Vec::new();
     for _ in 0..128 {
-        let bytes = from.mem_send()?.to_vec();
+        let bytes = from.mem_send().context("serialize parity frames")?.to_vec();
         if bytes.is_empty() {
             return Ok(wire);
         }
         assert_eq!(to.mem_recv(&bytes)?, bytes.len());
         wire.extend_from_slice(&bytes);
     }
-    panic!("sender did not quiesce");
+    bail!("sender did not quiesce");
 }
 
 fn pump<H: SessionHandler, G: SessionHandler>(
@@ -45,7 +46,7 @@ fn pump<H: SessionHandler, G: SessionHandler>(
             return Ok(());
         }
     }
-    panic!("connection did not quiesce");
+    bail!("connection did not quiesce");
 }
 
 fn handshake<H: SessionHandler, G: SessionHandler>(

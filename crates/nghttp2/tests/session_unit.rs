@@ -2,10 +2,12 @@
 
 use std::{cell::Cell, collections::VecDeque, rc::Rc};
 
+use anyhow::{Context, Result, bail};
 use nghttp2::{
     Client, ClientSession, CustomAllocator, DataPoll, DataProvider, DataSource, Error, ErrorCode,
-    EventCollector, FrameFlags, FrameType, HeaderField, NvFlags, Result, Server, ServerSession,
-    Session, SessionCtx, SessionEvent, SessionHandler, SessionOptions, SettingsEntry, SettingsId,
+    EventCollector, FrameFlags, FrameType, HeaderField, NvFlags, Result as NativeResult, Server,
+    ServerSession, Session, SessionCtx, SessionEvent, SessionHandler, SessionOptions,
+    SettingsEntry, SettingsId,
     callbacks::{CallbackResult, Frame},
     nv, sys,
 };
@@ -22,7 +24,7 @@ fn request() -> [HeaderField<'static>; 4] {
 fn transfer<R, H: SessionHandler, S, G: SessionHandler>(
     from: &mut Session<R, H>,
     to: &mut Session<S, G>,
-) -> Result<usize> {
+) -> NativeResult<usize> {
     let mut total = 0;
     for _ in 0..128 {
         let bytes = from.mem_send()?.to_vec();
@@ -50,12 +52,12 @@ fn pump<H: SessionHandler, G: SessionHandler>(
             return Ok(());
         }
     }
-    panic!("connection did not quiesce within 16 exchanges");
+    bail!("connection did not quiesce within 16 exchanges");
 }
 
 fn pair() -> Result<(ClientSession, ServerSession)> {
-    let mut client = Session::client(EventCollector::new(), None, None)?;
-    let mut server = Session::server(EventCollector::new(), None, None)?;
+    let mut client = Session::client(EventCollector::new(), None, None).context("create client")?;
+    let mut server = Session::server(EventCollector::new(), None, None).context("create server")?;
     client.submit_settings(&[])?;
     server.submit_settings(&[])?;
     pump(&mut client, &mut server)?;
@@ -200,7 +202,7 @@ fn integration_lifecycle_scenario_deferred_owned_provider_resumes_and_drops_once
 
 struct Respond {
     dropped: Rc<Cell<usize>>,
-    submitted: Option<Result<()>>,
+    submitted: Option<NativeResult<()>>,
 }
 
 impl SessionHandler for Respond {
@@ -695,7 +697,7 @@ fn integration_lifecycle_scenario_sessions_with_matching_stream_ids_release_only
 }
 
 struct ContextData {
-    submitted: Option<Result<()>>,
+    submitted: Option<NativeResult<()>>,
     panic: bool,
 }
 

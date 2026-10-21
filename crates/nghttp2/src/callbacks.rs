@@ -56,9 +56,10 @@ impl core::ops::Deref for Frame {
     }
 }
 /// A handler failure that terminates native callback processing.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, thiserror::Error)]
 pub enum CallbackError {
     /// The callback cannot complete its operation.
+    #[error("native callback processing failed")]
     Failure,
 }
 /// Result of a notification callback.
@@ -270,7 +271,6 @@ pub(crate) struct CallbackBox<H: SessionHandler> {
     in_callback: Cell<bool>,
     poisoned: Cell<bool>,
 }
-#[allow(dead_code)] // consumed by the session layer, not by the callback table
 impl<H: SessionHandler> CallbackBox<H> {
     pub(crate) fn new(handler: H) -> Self {
         Self {

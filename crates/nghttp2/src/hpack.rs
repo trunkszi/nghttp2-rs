@@ -2,7 +2,7 @@
 //!
 //! Contexts are single-threaded and retain their dynamic tables across header
 //! blocks. Emitted headers are owned so later decoding cannot invalidate them.
-use std::{fmt, marker::PhantomData, ptr::NonNull, rc::Rc};
+use std::{marker::PhantomData, ptr::NonNull, rc::Rc};
 
 use nghttp2_sys as sys;
 pub use nghttp2_sys::{nghttp2_hd_deflater, nghttp2_hd_inflater};
@@ -20,14 +20,9 @@ pub type RawHdInflater = nghttp2_hd_inflater;
 pub const DEFAULT_DYNAMIC_TABLE_SIZE: u32 = sys::NGHTTP2_DEFAULT_HEADER_TABLE_SIZE;
 
 /// Native HPACK failure code, preserved without losing its numeric value.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, thiserror::Error)]
+#[error("HPACK error {0}")]
 pub struct HpackError(pub RawErrorCode);
-impl fmt::Display for HpackError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "HPACK error {}", self.0)
-    }
-}
-impl std::error::Error for HpackError {}
 /// Result of a standalone HPACK operation.
 pub type HpackResult<T> = Result<T, HpackError>;
 

@@ -1,6 +1,7 @@
 //! Elapsed-time microbenchmarks; session measurements include construction and teardown.
 use std::{hint::black_box, time::Instant};
 
+use anyhow::{Context, Result, bail, ensure};
 use nghttp2::{
     event::SessionEvent,
     hpack::{HpDeflater, HpInflater, HpackHeader},
@@ -9,9 +10,9 @@ use nghttp2::{
     submit::DataProvider,
 };
 
-fn session_exchange() -> Result<usize, Box<dyn std::error::Error>> {
-    let mut client = ClientSession::new_default(None, None)?;
-    let mut server = ServerSession::new_default(None, None)?;
+fn session_exchange() -> Result<usize> {
+    let mut client = ClientSession::new_default(None, None).context("create benchmark client")?;
+    let mut server = ServerSession::new_default(None, None).context("create benchmark server")?;
     client.submit_settings(&[])?;
     server.submit_settings(&[])?;
     let stream = client.submit_request(
@@ -28,15 +29,21 @@ fn session_exchange() -> Result<usize, Box<dyn std::error::Error>> {
     loop {
         let request = client.mem_send()?.to_vec();
         if !request.is_empty() {
-            assert_eq!(server.mem_recv(&request)?, request.len());
+            ensure!(
+                server
+                    .mem_recv(&request)
+                    .context("parse benchmark request")?
+                    == request.len(),
+                "incomplete request buffer consumption"
+            );
         }
         for event in server.drain_events().collect::<Vec<_>>() {
             if let SessionEvent::DataChunk {
                 stream_id, data, ..
             } = event
             {
-                assert_eq!(stream_id, stream);
-                assert_eq!(data, b"ping");
+                ensure!(stream_id == stream, "response stream identifier changed");
+                ensure!(data == b"ping", "unexpected benchmark request payload");
                 replied = true;
             }
         }
@@ -50,7 +57,13 @@ fn session_exchange() -> Result<usize, Box<dyn std::error::Error>> {
         }
         let response = server.mem_send()?.to_vec();
         if !response.is_empty() {
-            assert_eq!(client.mem_recv(&response)?, response.len());
+            ensure!(
+                client
+                    .mem_recv(&response)
+                    .context("parse benchmark response")?
+                    == response.len(),
+                "incomplete response buffer consumption"
+            );
         }
         for event in client.drain_events() {
             if let SessionEvent::DataChunk { data, .. } = event {
@@ -61,27 +74,31 @@ fn session_exchange() -> Result<usize, Box<dyn std::error::Error>> {
             break;
         }
     }
-    assert_eq!(received, b"pong");
+    ensure!(received == b"pong", "unexpected benchmark response payload");
     Ok(received.len())
 }
-fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let iterations =
-        std::env::var("H2_BENCH_ITERATIONS").map_or(Ok(10_000usize), |text| text.parse())?;
+fn main() -> Result<()> {
+    let iterations = std::env::var("H2_BENCH_ITERATIONS")
+        .map_or(Ok(10_000usize), |text| text.parse())
+        .context("parse H2_BENCH_ITERATIONS as an unsigned integer")?;
     if iterations == 0 {
-        return Err("H2_BENCH_ITERATIONS must be positive".into());
+        bail!("H2_BENCH_ITERATIONS must be positive");
     }
     let headers = [
         HpackHeader::new(b":method", b"POST"),
         HpackHeader::new(b":path", b"/pkg.Service/Call"),
         HpackHeader::new(b"content-type", b"application/grpc"),
     ];
-    let mut encoder = HpDeflater::new(4096)?;
-    let mut decoder = HpInflater::new()?;
+    let mut encoder = HpDeflater::new(4096).context("create HPACK encoder")?;
+    let mut decoder = HpInflater::new().context("create HPACK decoder")?;
     let start = Instant::now();
     for _ in 0..iterations {
         let block = encoder.deflate_vec(black_box(&headers))?;
         let decoded = decoder.inflate_block(black_box(&block))?;
-        assert_eq!(decoded.len(), headers.len());
+        ensure!(
+            decoded.len() == headers.len(),
+            "HPACK changed the header count"
+        );
         black_box(decoded);
     }
     println!(
@@ -90,7 +107,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let start = Instant::now();
     for _ in 0..iterations {
-        black_box(session_exchange()?);
+        black_box(session_exchange().context("run HTTP/2 exchange")?);
     }
     println!(
         "HTTP/2 handshake+request+response+teardown: {:.1} ns/exchange ({iterations} iterations)",
