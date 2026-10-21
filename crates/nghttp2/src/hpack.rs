@@ -70,6 +70,11 @@ pub struct InflateStep {
     pub finished: bool,
 }
 
+fn check_table_size(size: usize) -> HpackResult<()> {
+    u32::try_from(size)
+        .map(|_| ())
+        .map_err(|_| HpackError(sys::NGHTTP2_ERR_INVALID_ARGUMENT))
+}
 fn check(code: RawErrorCode) -> HpackResult<()> {
     if code < 0 {
         Err(HpackError(code))
@@ -102,6 +107,34 @@ unsafe fn header_view<'a>(raw: *const RawHeaderField) -> Option<HpackHeader<'a>>
         no_index: raw.flags & NGHTTP2_NV_FLAG_NO_INDEX as u8 != 0,
     })
 }
+macro_rules! table_accessors {
+    ($count:ident, $entry:ident, $size:ident, $max:ident) => {
+        /// Includes all 61 static entries and current dynamic entries.
+        #[must_use]
+        pub fn num_table_entries(&self) -> usize {
+            // SAFETY: this read-only getter receives the live owned context.
+            unsafe { sys::$count(self.ptr.as_ptr()) }
+        }
+        /// Borrows a 1-based entry; zero and out-of-range indices return None.
+        #[must_use]
+        pub fn table_entry(&self, index: usize) -> Option<HpackHeader<'_>> {
+            // SAFETY: &self prevents table mutation during the returned borrow.
+            unsafe { header_view(sys::$entry(self.ptr.as_ptr(), index)) }
+        }
+        /// Used dynamic bytes, including the 32-byte per-entry overhead.
+        #[must_use]
+        pub fn dynamic_table_size(&self) -> usize {
+            // SAFETY: this read-only getter receives the live owned context.
+            unsafe { sys::$size(self.ptr.as_ptr()) }
+        }
+        /// Current maximum dynamic table size in bytes.
+        #[must_use]
+        pub fn max_dynamic_table_size(&self) -> usize {
+            // SAFETY: this read-only getter receives the live owned context.
+            unsafe { sys::$max(self.ptr.as_ptr()) }
+        }
+    };
+}
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum InflateState {
     Ready,
@@ -117,7 +150,6 @@ pub struct HpInflater {
 }
 impl HpInflater {
     /// Creates an independent decoder with the default dynamic table limit.
-    ///
     /// # Errors
     /// Returns the native allocation error if construction fails.
     pub fn new() -> HpackResult<Self> {
@@ -125,12 +157,10 @@ impl HpInflater {
         unsafe { Self::create(std::ptr::null_mut()) }
     }
     /// Creates a decoder with a custom allocator table.
-    ///
     /// # Safety
     /// All allocator callbacks must be present, mutually compatible C allocators,
     /// and must not unwind. The table must stay at the same address, and its
     /// user-data/resources must remain valid through decoder destruction.
-    ///
     /// # Errors
     /// Returns the native allocation error if construction fails.
     pub unsafe fn new_with_mem(mem: &RawAllocator) -> HpackResult<Self> {
@@ -148,10 +178,10 @@ impl HpInflater {
         })
     }
     /// Updates the SETTINGS_HEADER_TABLE_SIZE limit between completed blocks.
-    ///
     /// # Errors
-    /// Returns INVALID_STATE during a block, or a native allocation error.
+    /// Returns INVALID_ARGUMENT above u32::MAX, INVALID_STATE during a block, or NOMEM.
     pub fn change_table_size(&mut self, size: usize) -> HpackResult<()> {
+        check_table_size(size)?;
         if self.state != InflateState::Ready {
             return Err(HpackError(sys::NGHTTP2_ERR_INVALID_STATE));
         }
@@ -159,11 +189,9 @@ impl HpInflater {
         check(unsafe { sys::nghttp2_hd_inflate_change_table_size(self.ptr.as_ptr(), size) })
     }
     /// Processes part of a block, copying any emitted header before returning.
-    ///
     /// Pass `final_chunk = true` on the last chunk and on subsequent calls with
     /// its remaining suffix (including an empty suffix). Continue until finished,
     /// then call `end_headers`. A header can be emitted without consuming input.
-    ///
     /// # Errors
     /// Returns the native decoder error, or INVALID_STATE after completion until
     /// `end_headers` is called. A native decoder error is permanent.
@@ -218,7 +246,6 @@ impl HpInflater {
         })
     }
     /// Decodes one complete block and prepares the table for the next block.
-    ///
     /// # Errors
     /// Returns INVALID_STATE if a streaming block is active, or the native error
     /// for truncated, malformed, oversized, or unallocatable header data.
@@ -249,7 +276,6 @@ impl HpInflater {
         }
     }
     /// Releases per-block resources after a step reports `finished`.
-    ///
     /// # Errors
     /// Returns INVALID_STATE for incomplete, idle, or failed blocks.
     pub fn end_headers(&mut self) -> HpackResult<()> {
@@ -261,36 +287,12 @@ impl HpInflater {
         self.state = InflateState::Ready;
         Ok(())
     }
-    /// Includes all 61 static entries plus the current dynamic entries.
-    #[must_use]
-    pub fn num_table_entries(&self) -> usize {
-        // SAFETY: this read-only native getter receives the live owned context.
-        unsafe { sys::nghttp2_hd_inflate_get_num_table_entries(self.ptr.as_ptr()) }
-    }
-    /// Returns a borrowed 1-based entry, or None for zero or an out-of-range index.
-    #[must_use]
-    pub fn table_entry(&self, index: usize) -> Option<HpackHeader<'_>> {
-        // SAFETY: nghttp2 returns a live table entry or null; &self prevents mutation while
-        // borrowed.
-        unsafe {
-            header_view(sys::nghttp2_hd_inflate_get_table_entry(
-                self.ptr.as_ptr(),
-                index,
-            ))
-        }
-    }
-    /// Used dynamic table bytes, including the RFC 7541 per-entry overhead.
-    #[must_use]
-    pub fn dynamic_table_size(&self) -> usize {
-        // SAFETY: this read-only native getter receives the live owned context.
-        unsafe { sys::nghttp2_hd_inflate_get_dynamic_table_size(self.ptr.as_ptr()) }
-    }
-    /// Current maximum dynamic table size in bytes.
-    #[must_use]
-    pub fn max_dynamic_table_size(&self) -> usize {
-        // SAFETY: this read-only native getter receives the live owned context.
-        unsafe { sys::nghttp2_hd_inflate_get_max_dynamic_table_size(self.ptr.as_ptr()) }
-    }
+    table_accessors!(
+        nghttp2_hd_inflate_get_num_table_entries,
+        nghttp2_hd_inflate_get_table_entry,
+        nghttp2_hd_inflate_get_dynamic_table_size,
+        nghttp2_hd_inflate_get_max_dynamic_table_size
+    );
 }
 impl Drop for HpInflater {
     fn drop(&mut self) {
@@ -305,22 +307,19 @@ pub struct HpDeflater {
 }
 impl HpDeflater {
     /// Creates an encoder with a hard upper bound on dynamic-table memory.
-    ///
     /// # Errors
-    /// Returns the native allocation error if construction fails.
+    /// Returns INVALID_ARGUMENT above u32::MAX, or the native allocation error.
     pub fn new(max_dynamic_table_size: usize) -> HpackResult<Self> {
         // SAFETY: null selects the default allocator.
         unsafe { Self::create(max_dynamic_table_size, std::ptr::null_mut()) }
     }
     /// Creates an encoder with a custom allocator.
-    ///
     /// # Safety
     /// Callbacks must be present, compatible C allocators and must not unwind.
     /// The table must stay at the same address and its user-data/resources must
     /// remain valid through encoder destruction.
-    ///
     /// # Errors
-    /// Returns the native allocation error if construction fails.
+    /// Returns INVALID_ARGUMENT above u32::MAX, or the native allocation error.
     pub unsafe fn new_with_mem(
         max_dynamic_table_size: usize,
         mem: &RawAllocator,
@@ -329,6 +328,7 @@ impl HpDeflater {
         unsafe { Self::create(max_dynamic_table_size, std::ptr::from_ref(mem).cast_mut()) }
     }
     unsafe fn create(size: usize, mem: *mut RawAllocator) -> HpackResult<Self> {
+        check_table_size(size)?;
         let mut ptr = std::ptr::null_mut();
         // SAFETY: ptr is writable; mem satisfies the constructor's allocator contract.
         check(unsafe { sys::nghttp2_hd_deflate_new2(&mut ptr, size, mem) })?;
@@ -338,15 +338,14 @@ impl HpDeflater {
         })
     }
     /// Applies the peer's table limit, capped by the constructor's memory limit.
-    ///
     /// # Errors
-    /// Returns the native allocation error if resizing fails.
+    /// Returns INVALID_ARGUMENT above u32::MAX, or the native allocation error.
     pub fn change_table_size(&mut self, size: usize) -> HpackResult<()> {
+        check_table_size(size)?;
         // SAFETY: this exclusively borrowed context remains live.
         check(unsafe { sys::nghttp2_hd_deflate_change_table_size(self.ptr.as_ptr(), size) })
     }
     /// Returns the native upper bound on encoded bytes.
-    ///
     /// # Errors
     /// Returns BUFFER_ERROR on arithmetic overflow or NOMEM on descriptor allocation failure.
     pub fn deflate_bound(&self, headers: &[HpackHeader<'_>]) -> HpackResult<usize> {
@@ -356,10 +355,8 @@ impl HpDeflater {
         Ok(unsafe { sys::nghttp2_hd_deflate_bound(self.ptr.as_ptr(), raw.as_ptr(), raw.len()) })
     }
     /// Encodes a complete block into caller-provided storage.
-    ///
     /// Size storage using `deflate_bound`. A native encoding failure (including
     /// insufficient output space) permanently poisons the native encoder.
-    ///
     /// # Errors
     /// Returns the native compression/allocation/buffer error or BUFFER_ERROR on overflow.
     pub fn deflate_into(
@@ -388,7 +385,6 @@ impl HpDeflater {
         }
     }
     /// Encodes one complete block into an owned buffer.
-    ///
     /// # Errors
     /// Returns allocation, bound-overflow, or native compression errors.
     pub fn deflate_vec(&mut self, headers: &[HpackHeader<'_>]) -> HpackResult<Vec<u8>> {
@@ -402,35 +398,12 @@ impl HpDeflater {
         output.truncate(written);
         Ok(output)
     }
-    /// Includes the 61 static entries and all dynamic entries.
-    #[must_use]
-    pub fn num_table_entries(&self) -> usize {
-        // SAFETY: this is a read-only query of a live context.
-        unsafe { sys::nghttp2_hd_deflate_get_num_table_entries(self.ptr.as_ptr()) }
-    }
-    /// Borrows a 1-based static or dynamic entry; invalid indices return None.
-    #[must_use]
-    pub fn table_entry(&self, index: usize) -> Option<HpackHeader<'_>> {
-        // SAFETY: the table is live, and &self prevents mutation during the returned borrow.
-        unsafe {
-            header_view(sys::nghttp2_hd_deflate_get_table_entry(
-                self.ptr.as_ptr(),
-                index,
-            ))
-        }
-    }
-    /// Used dynamic bytes including 32 bytes of overhead per entry.
-    #[must_use]
-    pub fn dynamic_table_size(&self) -> usize {
-        // SAFETY: this is a read-only query of a live context.
-        unsafe { sys::nghttp2_hd_deflate_get_dynamic_table_size(self.ptr.as_ptr()) }
-    }
-    /// Active maximum table size, bounded by the constructor limit.
-    #[must_use]
-    pub fn max_dynamic_table_size(&self) -> usize {
-        // SAFETY: this is a read-only query of a live context.
-        unsafe { sys::nghttp2_hd_deflate_get_max_dynamic_table_size(self.ptr.as_ptr()) }
-    }
+    table_accessors!(
+        nghttp2_hd_deflate_get_num_table_entries,
+        nghttp2_hd_deflate_get_table_entry,
+        nghttp2_hd_deflate_get_dynamic_table_size,
+        nghttp2_hd_deflate_get_max_dynamic_table_size
+    );
 }
 impl Drop for HpDeflater {
     fn drop(&mut self) {
@@ -472,18 +445,46 @@ fn raw_headers(headers: &[HpackHeader<'_>]) -> HpackResult<Vec<RawHeaderField>> 
 }
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::{HpackHeader as Header, *};
+    const ARGUMENT: HpackError = HpackError(sys::NGHTTP2_ERR_INVALID_ARGUMENT);
+    const INVALID: HpackError = HpackError(sys::NGHTTP2_ERR_INVALID_STATE);
+    const COMPRESSION: HpackError = HpackError(sys::NGHTTP2_ERR_HEADER_COMP);
+    fn inflate_chunks<'a>(
+        dec: &mut HpInflater,
+        chunks: impl IntoIterator<Item = (&'a [u8], bool)>,
+    ) -> Vec<InflatedHeader> {
+        let mut output = Vec::new();
+        for (mut rest, last) in chunks {
+            loop {
+                let step = dec.inflate_step(rest, last).unwrap();
+                rest = &rest[step.consumed..];
+                let emitted = step.header.is_some();
+                output.extend(step.header);
+                if step.finished {
+                    assert!(last && rest.is_empty());
+                    dec.end_headers().unwrap();
+                    break;
+                }
+                if rest.is_empty() && !emitted {
+                    break;
+                }
+                assert!(step.consumed > 0 || emitted);
+            }
+        }
+        assert!(matches!(dec.state, InflateState::Ready));
+        output
+    }
     fn roundtrip(chunk: usize) {
         let headers = [
-            HpackHeader::new(b":method", b"POST"),
-            HpackHeader::new(b":path", b"/pkg.Service/Call"),
-            HpackHeader::new(b"content-type", b"application/grpc"),
-            HpackHeader::new(b"te", b"trailers"),
-            HpackHeader::new(b"opaque-bin", b"\0\xff\x80ab\0"),
-            HpackHeader::new(b"x-repeat", b"one"),
-            HpackHeader::new(b"x-repeat", b"two"),
-            HpackHeader::new(b"x-empty", b""),
-            HpackHeader::new(b"authorization", b"secret").with_no_index(true),
+            Header::new(b":method", b"POST"),
+            Header::new(b":path", b"/pkg.Service/Call"),
+            Header::new(b"content-type", b"application/grpc"),
+            Header::new(b"te", b"trailers"),
+            Header::new(b"opaque-bin", b"\0\xff\x80ab\0"),
+            Header::new(b"x-repeat", b"one"),
+            Header::new(b"x-repeat", b"two"),
+            Header::new(b"x-empty", b""),
+            Header::new(b"authorization", b"secret").with_no_index(true),
         ];
         let mut enc = HpDeflater::new(4096).unwrap();
         let mut dec = HpInflater::new().unwrap();
@@ -495,35 +496,20 @@ mod tests {
             let decoded = if chunk == 0 {
                 dec.inflate_block(&block).unwrap()
             } else {
-                let mut out = Vec::new();
-                let pieces: Vec<_> = block.chunks(chunk).collect();
-                for (n, piece) in pieces.iter().enumerate() {
-                    let final_chunk = n + 1 == pieces.len();
-                    let mut remaining = *piece;
-                    loop {
-                        let step = dec.inflate_step(remaining, final_chunk).unwrap();
-                        remaining = &remaining[step.consumed..];
-                        let emitted = step.header.is_some();
-                        out.extend(step.header);
-                        if step.finished {
-                            assert!(final_chunk && remaining.is_empty());
-                            dec.end_headers().unwrap();
-                            break;
-                        }
-                        if remaining.is_empty() && !emitted {
-                            break;
-                        }
-                        assert!(step.consumed > 0 || emitted);
-                    }
-                }
-                assert!(matches!(dec.state, InflateState::Ready));
-                out
+                let chunks = block.chunks(chunk);
+                let count = chunks.len();
+                let chunks = chunks.enumerate().map(|(n, p)| (p, n + 1 == count));
+                inflate_chunks(&mut dec, chunks)
             };
             assert_eq!(decoded.len(), headers.len());
             for (got, expected) in decoded.iter().zip(headers) {
                 assert_eq!(got.name, expected.name);
                 assert_eq!(got.value, expected.value);
                 assert_eq!(got.no_index, expected.no_index);
+            }
+            for index in 62..=enc.num_table_entries() {
+                assert_ne!(enc.table_entry(index).unwrap().name, b"authorization");
+                assert_ne!(dec.table_entry(index).unwrap().name, b"authorization");
             }
             assert_eq!(enc.dynamic_table_size(), dec.dynamic_table_size());
             assert_eq!(enc.num_table_entries(), dec.num_table_entries());
@@ -538,20 +524,16 @@ mod tests {
     #[test]
     fn final_drain_and_block_lifecycle() {
         let mut dec = HpInflater::new().unwrap();
-        assert!(dec.inflate_block(&[]).unwrap().is_empty());
-        assert_eq!(
-            dec.end_headers(),
-            Err(HpackError(sys::NGHTTP2_ERR_INVALID_STATE))
-        );
+        for _ in 0..3 {
+            assert!(dec.inflate_block(&[]).unwrap().is_empty());
+        }
+        assert_eq!(dec.end_headers(), Err(INVALID));
         let step = dec.inflate_step(&[0x82], true).unwrap();
         assert_eq!(step.consumed, 1);
         assert!(!step.finished);
         let owned = step.header.unwrap();
         assert_eq!(owned.value, b"GET");
-        assert_eq!(
-            dec.change_table_size(0),
-            Err(HpackError(sys::NGHTTP2_ERR_INVALID_STATE))
-        );
+        assert_eq!(dec.change_table_size(0), Err(INVALID));
         assert!(dec.end_headers().is_err());
         assert!(dec.inflate_block(&[0x83]).is_err());
         let step = dec.inflate_step(&[], true).unwrap();
@@ -572,30 +554,13 @@ mod tests {
         ];
         for split in 0..=encoded.len() {
             let mut dec = HpInflater::new().unwrap();
-            let mut output = Vec::new();
-            for (mut rest, last) in [(&encoded[..split], false), (&encoded[split..], true)] {
-                loop {
-                    let step = dec.inflate_step(rest, last).unwrap();
-                    rest = &rest[step.consumed..];
-                    let emitted = step.header.is_some();
-                    output.extend(step.header);
-                    if step.finished {
-                        assert!(last && rest.is_empty());
-                        dec.end_headers().unwrap();
-                        break;
-                    }
-                    if rest.is_empty() && !emitted {
-                        break;
-                    }
-                    assert!(step.consumed > 0 || emitted);
-                }
-            }
-            assert!(matches!(dec.state, InflateState::Ready));
+            let output = inflate_chunks(
+                &mut dec,
+                [(&encoded[..split], false), (&encoded[split..], true)],
+            );
+            let fields: Vec<_> = output.iter().map(|h| (&h.name[..], &h.value[..])).collect();
             assert_eq!(
-                output
-                    .iter()
-                    .map(|h| (h.name.as_slice(), h.value.as_slice()))
-                    .collect::<Vec<_>>(),
+                fields,
                 [
                     (b":method".as_slice(), b"GET".as_slice()),
                     (b":scheme", b"http"),
@@ -609,6 +574,16 @@ mod tests {
     fn tables_and_resize_preserve_peer_state() {
         let mut enc = HpDeflater::new(4096).unwrap();
         let mut dec = HpInflater::new().unwrap();
+        if let Some(oversize) = (u32::MAX as usize).checked_add(1) {
+            assert_eq!(HpDeflater::new(oversize).err(), Some(ARGUMENT));
+            let invalid = Err(ARGUMENT);
+            assert_eq!(enc.change_table_size(oversize), invalid);
+            assert_eq!(dec.change_table_size(oversize), invalid);
+            assert_eq!(
+                (enc.max_dynamic_table_size(), dec.max_dynamic_table_size()),
+                (4096, 4096)
+            );
+        }
         assert_eq!(enc.num_table_entries(), 61);
         for index in 1..=61 {
             assert_eq!(enc.table_entry(index), dec.table_entry(index));
@@ -617,7 +592,7 @@ mod tests {
         assert!(enc.table_entry(62).is_none() && dec.table_entry(62).is_none());
         assert_eq!(enc.table_entry(2).unwrap().value, b"GET");
         for (name, value) in [(b"x".as_slice(), b"a".as_slice()), (b"y", b"b")] {
-            let block = enc.deflate_vec(&[HpackHeader::new(name, value)]).unwrap();
+            let block = enc.deflate_vec(&[Header::new(name, value)]).unwrap();
             assert_eq!(dec.inflate_block(&block).unwrap()[0].name, name);
             assert_eq!(enc.table_entry(62), dec.table_entry(62));
             assert_eq!(dec.table_entry(62).unwrap().value, value);
@@ -626,7 +601,7 @@ mod tests {
         assert_eq!(dec.dynamic_table_size(), 68);
         enc.change_table_size(34).unwrap();
         dec.change_table_size(34).unwrap();
-        let block = enc.deflate_vec(&[HpackHeader::new(b"y", b"b")]).unwrap();
+        let block = enc.deflate_vec(&[Header::new(b"y", b"b")]).unwrap();
         dec.inflate_block(&block).unwrap();
         assert_eq!(enc.max_dynamic_table_size(), 34);
         assert_eq!(dec.max_dynamic_table_size(), 34);
@@ -634,48 +609,71 @@ mod tests {
         assert_eq!(dec.dynamic_table_size(), 34);
         enc.change_table_size(0).unwrap();
         dec.change_table_size(0).unwrap();
-        let block = enc
-            .deflate_vec(&[HpackHeader::new(b":method", b"GET")])
-            .unwrap();
+        let method = [Header::new(b":method", b"GET")];
+        let block = enc.deflate_vec(&method).unwrap();
         assert_eq!(dec.inflate_block(&block).unwrap()[0].value, b"GET");
         assert_eq!(dec.num_table_entries(), 61);
         assert_eq!(enc.dynamic_table_size(), 0);
         let mut limited = HpDeflater::new(64).unwrap();
         limited.change_table_size(4096).unwrap();
         assert_eq!(limited.max_dynamic_table_size(), 64);
+        let mut largest = HpDeflater::new(u32::MAX as usize).unwrap();
+        largest.change_table_size(u32::MAX as usize).unwrap();
+        let bound = largest.deflate_bound(&[]).unwrap();
+        let mut output = vec![0; bound];
+        assert!(largest.deflate_into(&[], &mut output).unwrap() <= bound);
+        let mut enc = HpDeflater::new(0).unwrap();
+        let mut dec = HpInflater::new().unwrap();
+        dec.change_table_size(0).unwrap();
+        let headers = [Header::new(b"x", b"value")];
+        for _ in 0..2 {
+            let block = enc.deflate_vec(&headers).unwrap();
+            assert_eq!(dec.inflate_block(&block).unwrap()[0].value, b"value");
+            assert_eq!((enc.num_table_entries(), dec.num_table_entries()), (61, 61));
+            assert_eq!((enc.dynamic_table_size(), dec.dynamic_table_size()), (0, 0));
+        }
     }
     #[test]
     fn native_errors_are_permanent() {
         for block in [b"\x80".as_slice(), b"\xbe", b"\x00", b"\xff", b"\x82\x20"] {
             let mut dec = HpInflater::new().unwrap();
-            assert_eq!(
-                dec.inflate_block(block),
-                Err(HpackError(sys::NGHTTP2_ERR_HEADER_COMP))
-            );
-            assert_eq!(
-                dec.inflate_block(&[0x82]),
-                Err(HpackError(sys::NGHTTP2_ERR_HEADER_COMP))
-            );
+            for input in [block, &[0x82]] {
+                assert_eq!(dec.inflate_block(input), Err(COMPRESSION));
+            }
         }
         let mut enc = HpDeflater::new(4096).unwrap();
-        let headers = [HpackHeader::new(b"custom", b"a value")];
+        let headers = [Header::new(b"custom", b"a value")];
         assert_eq!(
             enc.deflate_into(&headers, &mut []),
             Err(HpackError(sys::NGHTTP2_ERR_INSUFF_BUFSIZE))
         );
-        assert_eq!(
-            enc.deflate_vec(&headers),
-            Err(HpackError(sys::NGHTTP2_ERR_HEADER_COMP))
-        );
+        assert_eq!(enc.deflate_vec(&headers), Err(COMPRESSION));
+    }
+    #[test]
+    fn resizing_rejects_missing_or_oversized_peer_update() {
+        for block in [b"\x82".as_slice(), b"\x3f\x22\x82"] {
+            let mut dec = HpInflater::new().unwrap();
+            dec.change_table_size(64).unwrap();
+            assert_eq!(dec.inflate_block(block).unwrap_err().0, COMPRESSION.0);
+        }
+        let mut dec = HpInflater::new().unwrap();
+        dec.change_table_size(64).unwrap();
+        assert_eq!(dec.inflate_block(b"\x3f\x21\x82").unwrap()[0].value, b"GET");
+        let step = dec.inflate_step(b"\x40", false).unwrap();
+        assert_eq!((step.consumed, step.finished), (1, false));
+        assert!(step.header.is_none());
+        assert_eq!(dec.change_table_size(0).unwrap_err().0, INVALID.0);
+        assert_eq!(dec.end_headers().unwrap_err().0, INVALID.0);
+        assert_eq!(dec.inflate_block(&[]).unwrap_err().0, INVALID.0);
+        let headers = inflate_chunks(&mut dec, [(b"\x01x\x01a".as_slice(), true)]);
+        assert_eq!(headers[0].value, b"a");
+        assert_eq!(dec.table_entry(62).unwrap().name, b"x");
     }
     use std::{cell::Cell, ffi::c_void};
     unsafe extern "C" {
-        #[link_name = "malloc"]
-        fn c_malloc(size: usize) -> *mut c_void;
-        #[link_name = "free"]
-        fn c_free(ptr: *mut c_void);
-        #[link_name = "realloc"]
-        fn c_realloc(ptr: *mut c_void, size: usize) -> *mut c_void;
+        fn malloc(size: usize) -> *mut c_void;
+        fn free(ptr: *mut c_void);
+        fn realloc(ptr: *mut c_void, size: usize) -> *mut c_void;
     }
     struct Counts {
         live: Cell<usize>,
@@ -684,8 +682,7 @@ mod tests {
     }
     impl Counts {
         fn permit(&self) -> bool {
-            let n = self.calls.get();
-            self.calls.set(n + 1);
+            let n = self.calls.replace(self.calls.get() + 1);
             n < self.limit
         }
     }
@@ -696,7 +693,7 @@ mod tests {
             return std::ptr::null_mut();
         }
         // SAFETY: C malloc accepts any requested size.
-        let ptr = unsafe { c_malloc(size) };
+        let ptr = unsafe { malloc(size) };
         if !ptr.is_null() {
             counts.live.set(counts.live.get() + 1);
         }
@@ -708,7 +705,7 @@ mod tests {
         }
         // SAFETY: this allocator's nonnull pointers came from C malloc/realloc.
         unsafe {
-            c_free(ptr);
+            free(ptr);
         }
         // SAFETY: Counts outlives every custom allocator callback.
         let counts = unsafe { &*data.cast::<Counts>() };
@@ -750,7 +747,7 @@ mod tests {
             return std::ptr::null_mut();
         }
         // SAFETY: a nonzero-size realloc preserves the live allocation count, even on failure.
-        unsafe { c_realloc(ptr, size) }
+        unsafe { realloc(ptr, size) }
     }
     #[test]
     fn custom_allocator_cleanup_and_failures() {
@@ -767,6 +764,12 @@ mod tests {
                 calloc: Some(tracked_calloc),
                 realloc: Some(tracked_realloc),
             };
+            if let Some(oversize) = (u32::MAX as usize).checked_add(1) {
+                // SAFETY: callbacks and state remain live throughout this rejected construction.
+                let error = unsafe { HpDeflater::new_with_mem(oversize, &mem) }.err();
+                assert_eq!(error, Some(ARGUMENT));
+                assert_eq!(counts.calls.get(), 0);
+            }
             // SAFETY: callbacks are compatible C allocators; mem and counts outlive both contexts.
             let enc = unsafe { HpDeflater::new_with_mem(4096, &mem) };
             // SAFETY: the same allocator lifetime and callback guarantees apply to the decoder.
@@ -774,18 +777,15 @@ mod tests {
             if limit == usize::MAX {
                 let mut enc = enc.unwrap();
                 let mut dec = dec.unwrap();
-                let block = enc
-                    .deflate_vec(&[HpackHeader::new(b"x-custom", b"owned")])
-                    .unwrap();
+                let headers = [Header::new(b"x-custom", b"owned")];
+                let block = enc.deflate_vec(&headers).unwrap();
                 assert_eq!(dec.inflate_block(&block).unwrap()[0].value, b"owned");
                 drop(enc);
                 assert!(counts.live.get() > 0);
                 drop(dec);
             } else {
-                if let Err(error) = &enc {
-                    assert_eq!(error.0, sys::NGHTTP2_ERR_NOMEM);
-                }
-                if let Err(error) = &dec {
+                let errors = [enc.as_ref().err(), dec.as_ref().err()];
+                for error in errors.into_iter().flatten() {
                     assert_eq!(error.0, sys::NGHTTP2_ERR_NOMEM);
                 }
                 drop(enc);
