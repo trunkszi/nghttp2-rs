@@ -21,3 +21,15 @@ pub const URGENCY_LOW: u32 = NGHTTP2_EXTPRI_URGENCY_LOW;
 
 /// Urgency assigned when a stream does not specify one.
 pub const URGENCY_DEFAULT: u32 = NGHTTP2_EXTPRI_DEFAULT_URGENCY;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn urgency_range_matches_rfc9218() {
+        assert_eq!(URGENCY_HIGH, 0);
+        assert_eq!(URGENCY_LOW, 7);
+        assert_eq!(URGENCY_DEFAULT, 3);
+    }
+}

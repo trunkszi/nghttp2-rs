@@ -1,9 +1,9 @@
 //! Safe, single-threaded HTTP/2 client and server sessions over `nghttp2`.
 //!
-//! The crate is organized around a non-owning [`context`] view of an
+//! The crate is organized into modules for a non-owning [`context`] view of an
 //! `nghttp2_session` and a user-supplied [`callbacks`] handler. Splitting those
-//! roles lets handlers submit frames and inspect stream state while the C library
-//! is iterating over them, without aliasing the handler's mutable borrow.
+//! roles will let handlers submit frames and inspect stream state while the C
+//! library is iterating over them, without aliasing the handler's mutable borrow.
 //!
 //! Modules mirror the C API surface:
 //!

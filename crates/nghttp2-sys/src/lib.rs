@@ -125,6 +125,41 @@ mod tests {
         assert_eq!(offset_of!(nghttp2_mem, free), 16);
         assert_eq!(offset_of!(nghttp2_mem, calloc), 24);
         assert_eq!(offset_of!(nghttp2_mem, realloc), 32);
+
+        assert_eq!(size_of::<nghttp2_vec>(), 16);
+        assert_eq!(offset_of!(nghttp2_vec, base), 0);
+        assert_eq!(offset_of!(nghttp2_vec, len), 8);
+
+        assert_eq!(size_of::<nghttp2_data_provider>(), 16);
+        assert_eq!(offset_of!(nghttp2_data_provider, source), 0);
+        assert_eq!(offset_of!(nghttp2_data_provider, read_callback), 8);
+
+        assert_eq!(size_of::<nghttp2_data_source>(), 8);
+        assert_eq!(offset_of!(nghttp2_data_source, fd), 0);
+        assert_eq!(offset_of!(nghttp2_data_source, ptr), 0);
+
+        assert_eq!(size_of::<nghttp2_priority>(), 32);
+        assert_eq!(offset_of!(nghttp2_priority, hd), 0);
+        assert_eq!(offset_of!(nghttp2_priority, pri_spec), 16);
+
+        assert_eq!(size_of::<nghttp2_ext_altsvc>(), 32);
+        assert_eq!(offset_of!(nghttp2_ext_altsvc, origin), 0);
+        assert_eq!(offset_of!(nghttp2_ext_altsvc, origin_len), 8);
+        assert_eq!(offset_of!(nghttp2_ext_altsvc, field_value), 16);
+        assert_eq!(offset_of!(nghttp2_ext_altsvc, field_value_len), 24);
+
+        assert_eq!(size_of::<nghttp2_origin_entry>(), 16);
+        assert_eq!(offset_of!(nghttp2_origin_entry, origin), 0);
+        assert_eq!(offset_of!(nghttp2_origin_entry, origin_len), 8);
+
+        assert_eq!(size_of::<nghttp2_ext_origin>(), 16);
+        assert_eq!(offset_of!(nghttp2_ext_origin, nov), 0);
+        assert_eq!(offset_of!(nghttp2_ext_origin, ov), 8);
+
+        assert_eq!(size_of::<nghttp2_ext_priority_update>(), 24);
+        assert_eq!(offset_of!(nghttp2_ext_priority_update, stream_id), 0);
+        assert_eq!(offset_of!(nghttp2_ext_priority_update, field_value), 8);
+        assert_eq!(offset_of!(nghttp2_ext_priority_update, field_value_len), 16);
     }
 
     #[test]

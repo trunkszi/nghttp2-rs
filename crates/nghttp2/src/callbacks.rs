@@ -6,7 +6,7 @@
 //! reporting.
 //!
 //! Every callback that re-enters Rust must be isolated from unwinding across the C
-//! stack; the safe wrapper installs trampolines that catch panics and report
+//! stack; the safe wrapper must install trampolines that catch panics and report
 //! `NGHTTP2_ERR_CALLBACK_FAILURE` to the library.
 
 pub use nghttp2_sys::nghttp2_session_callbacks;
@@ -22,3 +22,13 @@ pub type RawSendCallback = nghttp2_sys::nghttp2_send_callback2;
 
 /// Native frame-received callback.
 pub type RawFrameRecvCallback = nghttp2_sys::nghttp2_on_frame_recv_callback;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn callback_failure_matches_the_native_code() {
+        assert_eq!(CALLBACK_FAILURE, -902);
+    }
+}

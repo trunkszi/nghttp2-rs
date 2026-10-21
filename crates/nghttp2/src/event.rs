@@ -20,3 +20,20 @@ pub type RawFrameHeader = nghttp2_frame_hd;
 pub const fn frame_type(hd: &RawFrameHeader) -> u8 {
     hd.type_
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn frame_type_reads_the_header_byte() {
+        let hd = RawFrameHeader {
+            length: 0,
+            stream_id: 0,
+            type_: 4,
+            flags: 0,
+            reserved: 0,
+        };
+        assert_eq!(frame_type(&hd), 4);
+    }
+}

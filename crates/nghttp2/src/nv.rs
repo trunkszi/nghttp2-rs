@@ -26,7 +26,9 @@ pub const NO_COPY_FLAGS: RawHeaderFlags =
 /// Builds the raw `:method: POST` pseudo-header without copying either string.
 ///
 /// The name and value point at bytes embedded in the binary, so the descriptor
-/// remains valid for the lifetime of the process and needs no cleanup.
+/// remains valid for the lifetime of the process and needs no cleanup. The fields
+/// are `*mut` only because `nghttp2_nv` declares them that way; the buffers must
+/// never be written through.
 #[must_use]
 pub fn method_post() -> RawHeaderField {
     let (name, value) = nghttp2_macros::nv!(":method", "POST");
@@ -36,5 +38,34 @@ pub fn method_post() -> RawHeaderField {
         namelen: name.len(),
         valuelen: value.len(),
         flags: NO_COPY_FLAGS as u8,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn method_post_is_static_and_zero_copy() {
+        let field = method_post();
+        assert_eq!(field.flags, NO_COPY_FLAGS as u8);
+        assert_eq!(field.namelen, 7);
+        assert_eq!(field.valuelen, 4);
+        // SAFETY: method_post points at static byte strings of the stated lengths.
+        let (name, value) = unsafe {
+            (
+                core::slice::from_raw_parts(field.name, field.namelen),
+                core::slice::from_raw_parts(field.value, field.valuelen),
+            )
+        };
+        assert_eq!(name, b":method");
+        assert_eq!(value, b"POST");
+    }
+
+    #[test]
+    fn nv_macro_embeds_static_bytes() {
+        let (name, value) = nghttp2_macros::nv!(":path", "/");
+        assert_eq!(name, b":path");
+        assert_eq!(value, b"/");
     }
 }

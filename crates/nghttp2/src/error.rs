@@ -7,8 +7,8 @@
 //! rather than a failure: `NGHTTP2_ERR_WOULDBLOCK`, `NGHTTP2_ERR_DEFERRED`, and
 //! `NGHTTP2_ERR_PAUSE`.
 //!
-//! The typed error wrapper preserves the native code so diagnostics never lose
-//! information.
+//! The typed error wrapper will preserve the native code so diagnostics never
+//! lose information.
 
 use nghttp2_sys::{
     NGHTTP2_ERR_DEFERRED, NGHTTP2_ERR_FATAL, NGHTTP2_ERR_PAUSE, NGHTTP2_ERR_WOULDBLOCK,
@@ -34,4 +34,26 @@ pub const fn is_temporal(code: RawErrorCode) -> bool {
         code,
         NGHTTP2_ERR_WOULDBLOCK | NGHTTP2_ERR_DEFERRED | NGHTTP2_ERR_PAUSE
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn fatal_codes_stop_the_session() {
+        assert!(is_fatal(nghttp2_sys::NGHTTP2_ERR_FATAL));
+        assert!(is_fatal(nghttp2_sys::NGHTTP2_ERR_NOMEM));
+        assert!(!is_fatal(nghttp2_sys::NGHTTP2_ERR_INVALID_ARGUMENT));
+        assert!(!is_fatal(0));
+    }
+
+    #[test]
+    fn temporal_codes_are_retryable() {
+        assert!(is_temporal(NGHTTP2_ERR_WOULDBLOCK));
+        assert!(is_temporal(NGHTTP2_ERR_DEFERRED));
+        assert!(is_temporal(NGHTTP2_ERR_PAUSE));
+        assert!(!is_temporal(nghttp2_sys::NGHTTP2_ERR_FATAL));
+        assert!(!is_temporal(nghttp2_sys::NGHTTP2_ERR_INVALID_ARGUMENT));
+    }
 }

@@ -29,3 +29,14 @@ pub unsafe fn stream_id(stream: *mut RawStream) -> i32 {
     // SAFETY: the caller guarantees a live stream handle.
     unsafe { nghttp2_sys::nghttp2_stream_get_stream_id(stream) }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn null_stream_has_no_id() {
+        // SAFETY: the function explicitly accepts a null handle.
+        assert_eq!(unsafe { stream_id(core::ptr::null_mut()) }, 0);
+    }
+}

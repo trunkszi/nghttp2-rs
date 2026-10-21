@@ -20,6 +20,7 @@ stable = []
 
 [build-dependencies]
 cmake = { workspace = true }
+cc = { workspace = true }
 
 [lints]
 workspace = true

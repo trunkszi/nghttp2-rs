@@ -17,6 +17,7 @@ publish = false
 nghttp2-sys = { path = "crates/nghttp2-sys" }
 nghttp2-macros = { path = "crates/nghttp2-macros" }
 cmake = { version = "0.1" }
+cc = { version = "1" }
 syn = { version = "2", features = ["full", "extra-traits"] }
 quote = { version = "1" }
 proc-macro2 = { version = "1" }

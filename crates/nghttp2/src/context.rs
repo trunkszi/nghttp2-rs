@@ -5,9 +5,9 @@
 //! same `nghttp2_session`. Reconstructing the owning `Session` there would create a
 //! second mutable reference to it.
 //!
-//! `SessionCtx` instead carries only the raw pointer. Operations that take it use
-//! the pointer without borrowing the owner, so callback code cannot alias the outer
-//! session.
+//! This module provides the non-owning pointer aliases that will back
+//! `SessionCtx`. They carry no ownership, so callback code can use them without
+//! borrowing the outer session.
 
 pub use nghttp2_sys::nghttp2_session;
 

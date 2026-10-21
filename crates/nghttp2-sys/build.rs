@@ -9,7 +9,9 @@
 //! present in the assembled declarations.
 
 use std::{
-    env, fs,
+    env,
+    fmt::Write as _,
+    fs,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -31,6 +33,43 @@ const INCLUDE_GUARD_MACRO: &str = "H";
 
 /// Version macros supplied from the resolved source tree instead of the fragments.
 const GENERATED_VERSION_MACROS: &[&str] = &["VERSION", "VERSION_NUM"];
+
+type StructLayout = (&'static str, usize, &'static [(&'static str, usize)]);
+
+/// Expected layout of every public value type in `nghttp2.h` on a 64-bit target.
+///
+/// `build.rs` compiles these as C `_Static_assert`s against the resolved headers,
+/// so an upstream layout change fails the build instead of silently corrupting the
+/// ABI of the checked-in declarations.
+#[rustfmt::skip]
+const ABI_LAYOUT: &[StructLayout] = &[
+    ("nghttp2_info", 24, &[("age", 0), ("version_num", 4), ("version_str", 8), ("proto_str", 16)]),
+    ("nghttp2_vec", 16, &[("base", 0), ("len", 8)]),
+    ("nghttp2_nv", 40, &[("name", 0), ("value", 8), ("namelen", 16), ("valuelen", 24), ("flags", 32)]),
+    ("nghttp2_frame_hd", 16, &[("length", 0), ("stream_id", 8), ("type", 12), ("flags", 13), ("reserved", 14)]),
+    ("nghttp2_data_source", 8, &[("fd", 0), ("ptr", 0)]),
+    ("nghttp2_data_provider", 16, &[("source", 0), ("read_callback", 8)]),
+    ("nghttp2_data_provider2", 16, &[("source", 0), ("read_callback", 8)]),
+    ("nghttp2_data", 24, &[("hd", 0), ("padlen", 16)]),
+    ("nghttp2_priority_spec", 12, &[("stream_id", 0), ("weight", 4), ("exclusive", 8)]),
+    ("nghttp2_headers", 64, &[("hd", 0), ("padlen", 16), ("pri_spec", 24), ("nva", 40), ("nvlen", 48), ("cat", 56)]),
+    ("nghttp2_priority", 32, &[("hd", 0), ("pri_spec", 16)]),
+    ("nghttp2_rst_stream", 24, &[("hd", 0), ("error_code", 16)]),
+    ("nghttp2_settings_entry", 8, &[("settings_id", 0), ("value", 4)]),
+    ("nghttp2_settings", 32, &[("hd", 0), ("niv", 16), ("iv", 24)]),
+    ("nghttp2_push_promise", 48, &[("hd", 0), ("padlen", 16), ("nva", 24), ("nvlen", 32), ("promised_stream_id", 40), ("reserved", 44)]),
+    ("nghttp2_ping", 24, &[("hd", 0), ("opaque_data", 16)]),
+    ("nghttp2_goaway", 48, &[("hd", 0), ("last_stream_id", 16), ("error_code", 20), ("opaque_data", 24), ("opaque_data_len", 32), ("reserved", 40)]),
+    ("nghttp2_window_update", 24, &[("hd", 0), ("window_size_increment", 16), ("reserved", 20)]),
+    ("nghttp2_extension", 24, &[("hd", 0), ("payload", 16)]),
+    ("nghttp2_frame", 64, &[("hd", 0), ("data", 0), ("headers", 0), ("priority", 0), ("rst_stream", 0), ("settings", 0), ("push_promise", 0), ("ping", 0), ("goaway", 0), ("window_update", 0), ("ext", 0)]),
+    ("nghttp2_extpri", 8, &[("urgency", 0), ("inc", 4)]),
+    ("nghttp2_ext_altsvc", 32, &[("origin", 0), ("origin_len", 8), ("field_value", 16), ("field_value_len", 24)]),
+    ("nghttp2_origin_entry", 16, &[("origin", 0), ("origin_len", 8)]),
+    ("nghttp2_ext_origin", 16, &[("nov", 0), ("ov", 8)]),
+    ("nghttp2_ext_priority_update", 24, &[("stream_id", 0), ("field_value", 8), ("field_value_len", 16)]),
+    ("nghttp2_mem", 40, &[("mem_user_data", 0), ("malloc", 8), ("free", 16), ("calloc", 24), ("realloc", 32)]),
+];
 
 fn is_source_tree(path: &Path) -> bool {
     path.join("CMakeLists.txt").is_file()
@@ -75,26 +114,8 @@ fn parse_semver_tag(tag: &str) -> Option<(u32, u32, u32)> {
 }
 
 fn resolve_latest_release_tag(target_dir: &Path) -> String {
-    if let Ok(entries) = fs::read_dir(target_dir) {
-        let mut cached: Vec<(u32, u32, u32, String)> = entries
-            .flatten()
-            .filter_map(|entry| {
-                let path = entry.path();
-                if !is_source_tree(&path) {
-                    return None;
-                }
-                let name = entry.file_name().into_string().ok()?;
-                let tag = name.strip_prefix("nghttp2-")?;
-                let (maj, min, pat) = parse_semver_tag(tag)?;
-                Some((maj, min, pat, tag.to_owned()))
-            })
-            .collect();
-        cached.sort();
-        if let Some((_, _, _, tag)) = cached.pop() {
-            return tag;
-        }
-    }
-
+    // Ask the remote first so `stable` follows new releases; the cache scan below
+    // keeps offline builds working once a tag has been fetched.
     if let Ok(output) = Command::new("git")
         .args(["ls-remote", "--tags", "--refs", REPOSITORY, "v*"])
         .output()
@@ -112,6 +133,26 @@ fn resolve_latest_release_tag(target_dir: &Path) -> String {
             .collect();
         tags.sort();
         if let Some((_, _, _, tag)) = tags.pop() {
+            return tag;
+        }
+    }
+
+    if let Ok(entries) = fs::read_dir(target_dir) {
+        let mut cached: Vec<(u32, u32, u32, String)> = entries
+            .flatten()
+            .filter_map(|entry| {
+                let path = entry.path();
+                if !is_source_tree(&path) {
+                    return None;
+                }
+                let name = entry.file_name().into_string().ok()?;
+                let tag = name.strip_prefix("nghttp2-")?;
+                let (maj, min, pat) = parse_semver_tag(tag)?;
+                Some((maj, min, pat, tag.to_owned()))
+            })
+            .collect();
+        cached.sort();
+        if let Some((_, _, _, tag)) = cached.pop() {
             return tag;
         }
     }
@@ -264,6 +305,128 @@ fn build_static_library(source: &Path) -> PathBuf {
         .define("CMAKE_INSTALL_LIBDIR", "lib")
         .profile("Release")
         .build()
+}
+
+fn parse_integer_literal(value: &str) -> Option<i128> {
+    let value = value.trim().trim_end_matches(',');
+    let (negative, digits) = match value.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, value),
+    };
+    let digits = digits.replace('_', "");
+    let magnitude = match digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        Some(hex) => i128::from_str_radix(hex, 16).ok()?,
+        None => digits.parse::<i128>().ok()?,
+    };
+    Some(if negative { -magnitude } else { magnitude })
+}
+
+fn binding_constant<'a>(bindings: &'a str, name: &str) -> Option<&'a str> {
+    let marker = format!("pub const {name}:");
+    let start = bindings.find(&marker)? + marker.len();
+    let rest = &bindings[start..];
+    let equals = rest.find('=')?;
+    let end = rest[equals..].find(';')?;
+    Some(rest[equals + 1..equals + end].trim())
+}
+
+fn append_constant_assert(c_source: &mut String, bindings: &str, name: &str) {
+    let literal = binding_constant(bindings, name)
+        .unwrap_or_else(|| panic!("{name} is missing from the FFI fragments"));
+    let value = parse_integer_literal(literal)
+        .unwrap_or_else(|| panic!("{name} does not have a numeric value: {literal}"));
+    writeln!(
+        c_source,
+        "_Static_assert({name} == {value}, \"{name} value\");"
+    )
+    .expect("write C constant assertion");
+}
+
+fn append_enum_asserts(source: &Path, bindings: &str, c_source: &mut String) {
+    let text = fs::read_to_string(source.join(PUBLIC_HEADER))
+        .unwrap_or_else(|err| panic!("read {PUBLIC_HEADER}: {err}"));
+    let mut in_enum = false;
+    let mut next_value = 0_i128;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("typedef enum {") {
+            in_enum = true;
+            next_value = 0;
+            continue;
+        }
+        if in_enum && trimmed.starts_with('}') {
+            in_enum = false;
+            continue;
+        }
+        if !in_enum || !trimmed.starts_with("NGHTTP2_") {
+            continue;
+        }
+        let (name, header_value) = match trimmed.split_once('=') {
+            Some((name, value)) => (
+                name.trim(),
+                parse_integer_literal(value)
+                    .unwrap_or_else(|| panic!("non-literal enum value in {trimmed}")),
+            ),
+            None => (trimmed.trim_end_matches(',').trim(), next_value),
+        };
+        next_value = header_value + 1;
+        let literal = binding_constant(bindings, name)
+            .unwrap_or_else(|| panic!("{name} is missing from the FFI fragments"));
+        let rust_value = parse_integer_literal(literal)
+            .unwrap_or_else(|| panic!("{name} does not have a numeric value: {literal}"));
+        assert_eq!(
+            rust_value, header_value,
+            "{name} has value {rust_value} in the FFI fragments but {header_value} in nghttp2.h"
+        );
+        writeln!(
+            c_source,
+            "_Static_assert({name} == {rust_value}, \"{name} value\");"
+        )
+        .expect("write C enum assertion");
+    }
+}
+
+fn verify_c_layout(install_dir: &Path, out_dir: &Path, source: &Path, bindings: &str) {
+    let mut c_source = String::from(
+        "/* Generated by nghttp2-sys/build.rs. The checked-in Rust declarations must\nmatch the \
+         layout and constant values of the resolved C headers. */\n#include <stddef.h>\n#include \
+         <nghttp2/nghttp2.h>\n\n",
+    );
+    for &(name, size, fields) in ABI_LAYOUT {
+        writeln!(
+            c_source,
+            "_Static_assert(sizeof({name}) == {size}, \"{name} size\");"
+        )
+        .expect("write C layout assertion");
+        for &(field, offset) in fields {
+            writeln!(
+                c_source,
+                "_Static_assert(offsetof({name}, {field}) == {offset}, \"{name}.{field} offset\");"
+            )
+            .expect("write C layout assertion");
+        }
+    }
+    // These two macros use `sizeof`/cast expressions that rust-bindgen cannot
+    // render, so the compiler checks the values that the fragments declare.
+    append_constant_assert(&mut c_source, bindings, "NGHTTP2_PROTO_ALPN_LEN");
+    append_constant_assert(&mut c_source, bindings, "NGHTTP2_MAX_WINDOW_SIZE");
+    append_enum_asserts(source, bindings, &mut c_source);
+
+    let path = out_dir.join("layout_asserts.c");
+    fs::write(&path, c_source).expect("write layout_asserts.c");
+    let objects = cc::Build::new()
+        .file(&path)
+        .include(install_dir.join("include"))
+        .flag_if_supported("-std=c11")
+        .warnings(false)
+        .compile_intermediates();
+    assert!(
+        !objects.is_empty(),
+        "the C layout assertions did not produce an object file"
+    );
 }
 
 fn parse_version_header(path: &Path) -> (String, u32) {
@@ -461,6 +624,61 @@ fn verify_public_types(source: &Path, bindings: &str) {
             "nghttp2.h declares callback {name} but the FFI fragments do not"
         );
     }
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if !trimmed.starts_with("typedef ")
+            || !trimmed.ends_with(';')
+            || trimmed.contains("(*")
+            || trimmed.starts_with("typedef struct ")
+            || trimmed.starts_with("typedef union ")
+            || trimmed.starts_with("typedef enum ")
+        {
+            continue;
+        }
+        let name = trimmed
+            .trim_end_matches(';')
+            .split_whitespace()
+            .last()
+            .expect("scalar typedef name");
+        if !name.starts_with("nghttp2_") {
+            continue;
+        }
+        assert!(
+            bindings.contains(&format!("pub type {name} ")),
+            "nghttp2.h declares scalar typedef {name} but the FFI fragments do not"
+        );
+    }
+}
+
+fn verify_public_enums(source: &Path, bindings: &str) {
+    let text = fs::read_to_string(source.join(PUBLIC_HEADER))
+        .unwrap_or_else(|err| panic!("read {PUBLIC_HEADER}: {err}"));
+    let mut in_enum = false;
+    let mut constants = 0_usize;
+    for line in text.lines() {
+        let trimmed = line.trim();
+        if trimmed.starts_with("typedef enum {") {
+            in_enum = true;
+            continue;
+        }
+        if in_enum && trimmed.starts_with('}') {
+            in_enum = false;
+            continue;
+        }
+        if !in_enum {
+            continue;
+        }
+        let name = trimmed.split(['=', ',']).next().unwrap_or_default().trim();
+        if !name.starts_with("NGHTTP2_") {
+            continue;
+        }
+        assert!(
+            bindings.contains(&format!("pub const {name}")),
+            "nghttp2.h enum constant {name} is missing from the FFI fragments"
+        );
+        constants += 1;
+    }
+    assert!(constants > 0, "no enum constants found in nghttp2.h");
 }
 
 fn verify_bindings(source: &Path, bindings: &str) {
@@ -469,6 +687,7 @@ fn verify_bindings(source: &Path, bindings: &str) {
         .unwrap_or_else(|err| panic!("read {}: {err}", header_path.display()));
     verify_public_functions(&header, bindings);
     verify_public_constants(source, bindings);
+    verify_public_enums(source, bindings);
     verify_public_types(source, bindings);
 }
 
@@ -496,6 +715,7 @@ fn main() {
         parse_version_header(&install_dir.join("include/nghttp2/nghttp2ver.h"));
     let bindings = assemble_bindings(&manifest, &version, version_num);
     verify_bindings(&source, &bindings);
+    verify_c_layout(&install_dir, &out_dir, &source, &bindings);
     fs::write(out_dir.join("bindings.rs"), bindings).expect("write bindings.rs");
 
     let mut linked = false;

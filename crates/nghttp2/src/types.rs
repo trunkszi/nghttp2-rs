@@ -26,3 +26,16 @@ pub type FrameHeader = nghttp2_sys::nghttp2_frame_hd;
 pub const fn stream_id_bits(stream_id: StreamId) -> u32 {
     (stream_id as u32) & 0x7fff_ffff
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn stream_id_bits_clear_the_reserved_bit() {
+        assert_eq!(stream_id_bits(0), 0);
+        assert_eq!(stream_id_bits(1), 1);
+        assert_eq!(stream_id_bits(i32::MAX), 0x7fff_ffff);
+        assert_eq!(stream_id_bits(-1), 0x7fff_ffff);
+    }
+}
