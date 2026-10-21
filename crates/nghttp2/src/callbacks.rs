@@ -680,24 +680,27 @@ mod tests {
         }
     }
 
+    struct RefusingSendHandler;
+
+    impl SessionHandler for RefusingSendHandler {
+        fn send(&mut self, _: &mut SessionCtx<'_>, _: &[u8], _: c_int) -> nghttp2_ssize {
+            CALLBACK_FAILURE as nghttp2_ssize
+        }
+    }
+
     #[test]
-    fn callbacks_install_on_a_real_session() {
-        let callbacks = Callbacks::<TestHandler>::new().expect("callback table");
-        let (_boxed, user_data) = test_box(TestHandler);
+    fn callbacks_fire_on_a_real_session() {
+        let callbacks = Callbacks::<RefusingSendHandler>::new().expect("callback table");
+        let (_boxed, user_data) = test_box(RefusingSendHandler);
         let mut session = core::ptr::null_mut();
-        // SAFETY: the table and user data outlive the session; null option and
-        // allocator select the library defaults.
+        // SAFETY: nghttp2 copies the table; the user data outlives the session.
         let code = unsafe {
-            nghttp2_sys::nghttp2_session_client_new3(
-                &mut session,
-                callbacks.as_ptr(),
-                user_data,
-                core::ptr::null(),
-                core::ptr::null_mut(),
-            )
+            nghttp2_sys::nghttp2_session_client_new(&mut session, callbacks.as_ptr(), user_data)
         };
         assert_eq!(code, 0);
-        assert!(!session.is_null());
+        // SAFETY: the session is live and the handler rejects the queued client magic.
+        let code = unsafe { nghttp2_sys::nghttp2_session_send(session) };
+        assert_eq!(code, CALLBACK_FAILURE);
         // SAFETY: the session was created above and is deleted once.
         unsafe { nghttp2_sys::nghttp2_session_del(session) };
     }
