@@ -194,6 +194,29 @@ mod tests {
     }
 
     #[test]
+    fn unit_scenario_native_parser_handles_binary_input_and_duplicate_keys() {
+        // Structured dictionaries use the last occurrence of a duplicate key.
+        assert_eq!(
+            ExtPri::from_header("u=7, u=0, i=?0, i").unwrap(),
+            ExtPri::new(0, true).unwrap()
+        );
+        for byte in [0, b'\r', b'\n', 0x80, 0xff] {
+            let bytes = [b'u', b'=', b'1', b',', b' ', byte];
+            let mut priority = ExtPri::new(6, true).unwrap();
+            assert_eq!(
+                priority.parse_priority(bytes),
+                Err(nghttp2_sys::NGHTTP2_ERR_INVALID_ARGUMENT),
+                "accepted bytes {bytes:?}"
+            );
+            assert_eq!(priority, ExtPri::new(6, true).unwrap());
+        }
+        assert_eq!(
+            ExtPri::from_header("u=0;ignored=7, i=?1;ignored").unwrap(),
+            ExtPri::new(0, true).unwrap()
+        );
+    }
+
+    #[test]
     fn malformed_headers_never_partially_update_priority() {
         for header in [
             "u=8",

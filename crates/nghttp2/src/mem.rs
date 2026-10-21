@@ -57,13 +57,16 @@ impl State {
 /// Native allocator with stable userdata, optional payload budget, and counters.
 ///
 /// This value is single-threaded, as are the native objects borrowing its table.
-/// Moving it preserves the userdata address. Budget changes affect subsequent
-/// allocations only; lowering a budget never frees existing native allocations.
+/// Moving it preserves both the table and userdata addresses. Budget changes
+/// affect subsequent allocations only; lowering a budget never frees existing native allocations.
 /// Reallocation budgets count the final live payload, although replacement storage
 /// temporarily coexists with the old block until its contents have been copied.
+/// HPACK's upstream `nghttp2_hd.c` retains `context->mem` rather than copying
+/// the table. Both the table and tracking state therefore have heap-stable
+/// addresses until this owner is dropped. Native users must be destroyed first.
 /// Externally supplied tables retain their own ownership and accounting contract.
 pub struct CustomAllocator {
-    raw: RawAllocator,
+    raw: Box<RawAllocator>,
     state: Option<Box<State>>,
     _single_thread: PhantomData<Rc<()>>,
 }
@@ -92,7 +95,7 @@ impl CustomAllocator {
             realloc: Some(tracked_realloc),
         };
         Self {
-            raw,
+            raw: Box::new(raw),
             state: Some(state),
             _single_thread: PhantomData,
         }
@@ -108,7 +111,7 @@ impl CustomAllocator {
     /// by their originating allocator. The wrapper does not free external state.
     pub unsafe fn from_raw(raw: RawAllocator) -> Self {
         Self {
-            raw,
+            raw: Box::new(raw),
             state: None,
             _single_thread: PhantomData,
         }
@@ -343,40 +346,70 @@ mod tests {
     }
 
     #[test]
+    fn unit_scenario_lowered_budget_preserves_live_payload() {
+        let owner = CustomAllocator::with_limit(32);
+        let raw = owner.as_raw();
+        // SAFETY: live pointers always use their originating allocator, and all
+        // successful allocations are freed before dropping its owner.
+        unsafe {
+            let data = raw.mem_user_data;
+            let pointer = raw.malloc.unwrap()(16, data).cast::<u8>();
+            assert!(!pointer.is_null());
+            pointer.write(71);
+            assert!(owner.set_limit(8));
+            assert!(raw.realloc.unwrap()(pointer.cast(), 12, data).is_null());
+            assert_eq!(*pointer, 71);
+            assert_eq!(owner.stats().unwrap().live_bytes, 16);
+            let shrunk = raw.realloc.unwrap()(pointer.cast(), 8, data).cast::<u8>();
+            assert!(!shrunk.is_null());
+            assert_eq!(*shrunk, 71);
+            raw.free.unwrap()(shrunk.cast(), data);
+            let zero = raw.calloc.unwrap()(0, usize::MAX, data);
+            assert!(!zero.is_null());
+            raw.free.unwrap()(zero, data);
+        }
+        assert_eq!(owner.stats().unwrap().live_bytes, 0);
+        assert_eq!(owner.stats().unwrap().live_blocks, 0);
+        assert_eq!(owner.stats().unwrap().failed_allocations, 1);
+    }
+
+    #[test]
     fn integration_lifecycle_native_hpack_uses_stable_userdata_and_releases_all_blocks() {
         let owner = CustomAllocator::new();
-        let owner = Box::new(owner);
         let mut deflater = ptr::null_mut();
         let mut inflater = ptr::null_mut();
-        let mut table = *owner.as_raw();
-        // SAFETY: allocator and output pointers stay alive until both HPACK objects are deleted.
+        let table = ptr::from_ref(owner.as_raw()).cast_mut();
+        // SAFETY: HPACK retains but never mutates the heap table. Moving its owner
+        // preserves the table and userdata until both native objects are deleted.
         unsafe {
             assert_eq!(
-                nghttp2_sys::nghttp2_hd_deflate_new2(&mut deflater, 4096, &mut table),
+                nghttp2_sys::nghttp2_hd_deflate_new2(&mut deflater, 4096, table),
                 0
             );
             assert_eq!(
-                nghttp2_sys::nghttp2_hd_inflate_new2(&mut inflater, &mut table),
+                nghttp2_sys::nghttp2_hd_inflate_new2(&mut inflater, table),
                 0
             );
+            let owner = Box::new(owner);
+            assert_eq!(table.cast_const(), ptr::from_ref(owner.as_raw()));
             assert!(owner.stats().unwrap().live_bytes > 0);
             assert!(owner.stats().unwrap().live_blocks >= 2);
             nghttp2_sys::nghttp2_hd_deflate_del(deflater);
             nghttp2_sys::nghttp2_hd_inflate_del(inflater);
+            assert_eq!(owner.stats().unwrap().live_bytes, 0);
+            assert_eq!(owner.stats().unwrap().live_blocks, 0);
         }
-        assert_eq!(owner.stats().unwrap().live_bytes, 0);
-        assert_eq!(owner.stats().unwrap().live_blocks, 0);
     }
 
     #[test]
     fn integration_scenario_native_failure_and_budget_change() {
         let owner = CustomAllocator::with_limit(0);
         let mut inflater = ptr::null_mut();
-        let mut table = *owner.as_raw();
+        let table = ptr::from_ref(owner.as_raw()).cast_mut();
         // SAFETY: live allocator and valid output slot; allocation is rejected deterministically.
         unsafe {
             assert_ne!(
-                nghttp2_sys::nghttp2_hd_inflate_new2(&mut inflater, &mut table),
+                nghttp2_sys::nghttp2_hd_inflate_new2(&mut inflater, table),
                 0
             );
         }
@@ -386,7 +419,7 @@ mod tests {
         // SAFETY: owner outlives the successfully created inflater and its deletion.
         unsafe {
             assert_eq!(
-                nghttp2_sys::nghttp2_hd_inflate_new2(&mut inflater, &mut table),
+                nghttp2_sys::nghttp2_hd_inflate_new2(&mut inflater, table),
                 0
             );
             nghttp2_sys::nghttp2_hd_inflate_del(inflater);
@@ -402,13 +435,13 @@ mod tests {
         let external = unsafe { CustomAllocator::from_raw(*tracked.as_raw()) };
         assert_eq!(external.stats(), None);
         assert!(!external.set_limit(0));
-        let mut table = *external.as_raw();
+        let table = ptr::from_ref(external.as_raw()).cast_mut();
         let mut inflater = ptr::null_mut();
-        // SAFETY: both owners outlive the native context and the mutable table
-        // copy is only used for construction; nghttp2 copies it internally.
+        // SAFETY: both owners outlive the context. HPACK retains the heap table
+        // pointer without mutating the table through its C non-const signature.
         unsafe {
             assert_eq!(
-                nghttp2_sys::nghttp2_hd_inflate_new2(&mut inflater, &mut table),
+                nghttp2_sys::nghttp2_hd_inflate_new2(&mut inflater, table),
                 0
             );
             assert!(tracked.stats().unwrap().live_bytes > 0);
@@ -421,12 +454,12 @@ mod tests {
     fn integration_scenario_partial_native_construction_failure_releases_allocations() {
         for limit in [0, 64, 512, 4096, 16384] {
             let owner = CustomAllocator::with_limit(limit);
-            let mut table = *owner.as_raw();
+            let table = ptr::from_ref(owner.as_raw()).cast_mut();
             let mut deflater = ptr::null_mut();
             // SAFETY: native construction receives valid slots and an allocator
             // that stays live through failure cleanup or explicit destruction.
             unsafe {
-                let result = nghttp2_sys::nghttp2_hd_deflate_new2(&mut deflater, 4096, &mut table);
+                let result = nghttp2_sys::nghttp2_hd_deflate_new2(&mut deflater, 4096, table);
                 if result == 0 {
                     nghttp2_sys::nghttp2_hd_deflate_del(deflater);
                 }
@@ -438,7 +471,7 @@ mod tests {
             // SAFETY: the same live allocator is reused and each successful
             // native context is destroyed exactly once.
             unsafe {
-                let result = nghttp2_sys::nghttp2_hd_inflate_new2(&mut inflater, &mut table);
+                let result = nghttp2_sys::nghttp2_hd_inflate_new2(&mut inflater, table);
                 if result == 0 {
                     nghttp2_sys::nghttp2_hd_inflate_del(inflater);
                 }
