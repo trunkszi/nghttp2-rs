@@ -10,7 +10,7 @@ use std::{
     cell::Cell,
     ffi::c_void,
     marker::PhantomData,
-    ptr,
+    ptr::{self, NonNull},
     rc::Rc,
 };
 
@@ -67,7 +67,7 @@ impl State {
 /// Externally supplied tables retain their own ownership and accounting contract.
 pub struct CustomAllocator {
     raw: Box<RawAllocator>,
-    state: Option<Box<State>>,
+    state: Option<NonNull<State>>,
     _single_thread: PhantomData<Rc<()>>,
 }
 
@@ -85,10 +85,11 @@ impl CustomAllocator {
 
     /// Creates an allocator that rejects requests exceeding `max_live_bytes`.
     pub fn with_limit(max_live_bytes: usize) -> Self {
-        let mut state = Box::new(State::default());
+        let state = Box::new(State::default());
         state.limit.set(max_live_bytes);
+        let state = Box::into_non_null(state);
         let raw = RawAllocator {
-            mem_user_data: ptr::from_mut(state.as_mut()).cast(),
+            mem_user_data: state.as_ptr().cast(),
             malloc: Some(tracked_malloc),
             free: Some(tracked_free),
             calloc: Some(tracked_calloc),
@@ -125,16 +126,30 @@ impl CustomAllocator {
 
     /// Returns counters for built-in tracking, or `None` for an external table.
     pub fn stats(&self) -> Option<AllocationStats> {
-        self.state.as_ref().map(|state| state.stats.get())
+        self.state.map(|state| {
+            // SAFETY: this owner retains the raw allocation until Drop.
+            unsafe { state.as_ref() }.stats.get()
+        })
     }
 
     /// Changes the built-in payload budget; returns false for external tables.
     pub fn set_limit(&self, max_live_bytes: usize) -> bool {
-        if let Some(state) = &self.state {
-            state.limit.set(max_live_bytes);
+        if let Some(state) = self.state {
+            // SAFETY: state remains allocated; Cell serializes caller-thread updates.
+            unsafe { state.as_ref() }.limit.set(max_live_bytes);
             true
         } else {
             false
+        }
+    }
+}
+
+impl Drop for CustomAllocator {
+    fn drop(&mut self) {
+        if let Some(state) = self.state.take() {
+            // SAFETY: this is the unique owner of the raw Box allocation;
+            // native users must have been destroyed before the allocator owner.
+            drop(unsafe { Box::from_raw(state.as_ptr()) });
         }
     }
 }
@@ -480,5 +495,34 @@ mod tests {
             assert_eq!(stats.live_blocks, 0, "inflater budget {limit}");
             assert_eq!(stats.live_bytes, 0, "inflater budget {limit}");
         }
+    }
+    #[test]
+    fn integration_lifecycle_state_survives_owner_moves_and_observation() {
+        let allocator = CustomAllocator::with_limit(1024 * 1024);
+        let table = ptr::from_ref(allocator.as_raw()).cast_mut();
+        let userdata = allocator.as_raw().mem_user_data;
+        let mut inflater = ptr::null_mut();
+        // SAFETY: the native inflater borrows the retained heap-stable table and state.
+        unsafe {
+            assert_eq!(
+                nghttp2_sys::nghttp2_hd_inflate_new2(&mut inflater, table),
+                0
+            );
+        }
+        let mut owners = vec![allocator];
+        let moved = owners.pop().unwrap();
+        assert_eq!(moved.as_raw().mem_user_data, userdata);
+        assert!(moved.stats().unwrap().live_blocks > 0);
+        assert!(moved.set_limit(2 * 1024 * 1024));
+        // SAFETY: the same live owner/table is used after moves and field observations.
+        unsafe {
+            let raw = moved.as_raw();
+            let bytes = raw.malloc.unwrap()(16, userdata);
+            assert!(!bytes.is_null());
+            raw.free.unwrap()(bytes, userdata);
+            nghttp2_sys::nghttp2_hd_inflate_del(inflater);
+        }
+        assert_eq!(moved.stats().unwrap().live_blocks, 0);
+        assert_eq!(moved.stats().unwrap().live_bytes, 0);
     }
 }

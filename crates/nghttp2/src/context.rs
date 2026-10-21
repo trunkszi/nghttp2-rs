@@ -25,8 +25,51 @@ pub use nghttp2_sys::nghttp2_session;
 /// Opaque native session.
 pub type RawSession = nghttp2_session;
 
-/// Non-null pointer to a native session.
-pub type SessionPtr = core::ptr::NonNull<nghttp2_session>;
+/// Non-owning native session handle with a caller-established validity window.
+///
+/// Safe code cannot construct this handle from an arbitrary pointer:
+///
+/// ```compile_fail
+/// use nghttp2::context::{RawSession, SessionPtr};
+/// let raw = core::ptr::NonNull::<RawSession>::dangling();
+/// let session = SessionPtr::from_raw(raw);
+/// ```
+///
+/// The handle cannot be copied to detach it from its borrow:
+///
+/// ```compile_fail
+/// use nghttp2::context::SessionPtr;
+/// fn copy_handle<'a>(session: &SessionPtr<'a>) -> SessionPtr<'a> {
+///     *session
+/// }
+/// ```
+pub struct SessionPtr<'a> {
+    raw: NonNull<nghttp2_session>,
+    _lifetime: PhantomData<&'a mut nghttp2_session>,
+}
+
+impl<'a> SessionPtr<'a> {
+    /// Establishes a validity window for a native session pointer.
+    ///
+    /// # Safety
+    ///
+    /// `raw` must identify a live session throughout `'a`. The session must remain
+    /// on its owning thread and may not be destroyed during that window. Native
+    /// calls through other handles must respect nghttp2's re-entry rules and must
+    /// not invalidate a stream while a view borrowed from this handle is in use.
+    pub const unsafe fn from_raw(raw: NonNull<nghttp2_session>) -> Self {
+        Self {
+            raw,
+            _lifetime: PhantomData,
+        }
+    }
+
+    /// Returns the native pointer without transferring ownership.
+    #[must_use]
+    pub const fn as_ptr(&self) -> *mut nghttp2_session {
+        self.raw.as_ptr()
+    }
+}
 
 /// Non-null pointer to a native stream owned by a session.
 pub type StreamPtr = core::ptr::NonNull<nghttp2_sys::nghttp2_stream>;
@@ -51,7 +94,7 @@ impl<'a> SessionCtx<'a> {
     ///
     /// `raw` must be null or a live session pointer that outlives `'a`. nghttp2
     /// invokes callbacks synchronously on the session's thread, so the returned
-    /// handle must not escape the callback invocation.
+    /// handle must not escape the callback invocation when constructed there.
     pub(crate) unsafe fn from_raw(raw: *mut nghttp2_session) -> Option<Self> {
         Some(Self {
             raw: NonNull::new(raw)?,
@@ -80,26 +123,5 @@ impl core::fmt::Debug for SessionCtx<'_> {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn null_pointer_yields_no_context() {
-        let raw: *mut nghttp2_session = core::ptr::null_mut();
-        // SAFETY: `from_raw` explicitly accepts a null pointer and reports it as
-        // `None`.
-        let ctx = unsafe { SessionCtx::from_raw(raw) };
-        assert!(ctx.is_none());
-    }
-
-    #[test]
-    fn non_null_pointer_round_trips_without_dereferencing() {
-        let raw = NonNull::<nghttp2_session>::dangling().as_ptr();
-        // SAFETY: the handle stores the pointer and only hands it back; neither
-        // `as_ptr` nor the `Debug` impl dereferences it, so this dangling address
-        // never reaches a session.
-        let ctx = unsafe { SessionCtx::from_raw(raw) }.expect("non-null pointer");
-        assert_eq!(ctx.as_ptr(), raw);
-        assert_eq!(format!("{ctx:?}"), format!("SessionCtx({raw:p})"));
-    }
-}
+#[path = "../tests/support/context.rs"]
+mod tests;
