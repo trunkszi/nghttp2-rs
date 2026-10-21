@@ -1,12 +1,18 @@
 //! Outbound frame construction: submission validates arguments and queues frames
 //! without blocking; DATA comes from a buffer or a [`DataSource`], which can defer.
 
-use core::{any::Any, ffi::c_void, panic::AssertUnwindSafe, ptr};
+use core::{
+    any::Any,
+    ffi::c_void,
+    panic::AssertUnwindSafe,
+    ptr::{self, NonNull},
+};
 
 use nghttp2_sys::{
-    NGHTTP2_DATA_FLAG_EOF, NGHTTP2_DATA_FLAG_NO_COPY, NGHTTP2_ERR_CALLBACK_FAILURE, nghttp2_nv,
-    nghttp2_origin_entry, nghttp2_priority_spec, nghttp2_priority_spec_default_init,
-    nghttp2_session, nghttp2_session_change_extpri_stream_priority, nghttp2_session_consume,
+    NGHTTP2_DATA_FLAG_EOF, NGHTTP2_DATA_FLAG_NO_COPY, NGHTTP2_DATA_FLAG_NO_END_STREAM,
+    NGHTTP2_ERR_CALLBACK_FAILURE, nghttp2_nv, nghttp2_origin_entry, nghttp2_priority_spec,
+    nghttp2_priority_spec_default_init, nghttp2_session,
+    nghttp2_session_change_extpri_stream_priority, nghttp2_session_consume,
     nghttp2_session_consume_connection, nghttp2_session_consume_stream,
     nghttp2_session_get_extpri_stream_priority, nghttp2_session_resume_data,
     nghttp2_session_set_local_window_size, nghttp2_settings_entry, nghttp2_ssize,
@@ -19,7 +25,7 @@ use nghttp2_sys::{
 pub use nghttp2_sys::{nghttp2_data_provider2, nghttp2_data_source};
 
 use crate::{
-    context::SessionPtr,
+    context::{SessionCtx, SessionPtr},
     error::{Error, Result},
     nv::HeaderField,
     priority::ExtPri,
@@ -44,6 +50,8 @@ pub enum DataPoll<'a> {
     NoCopy(&'a [u8]),
     /// End of stream: no more bytes will follow.
     Eof,
+    /// Finish this body while keeping the stream open for trailing HEADERS.
+    EofWithTrailers,
     /// Nothing to send now; [`SessionSubmit::resume_data`] restarts the stream.
     Deferred,
 }
@@ -71,16 +79,23 @@ impl Pending {
 
 /// State behind [`DataProvider`]; boxed so its address never changes.
 struct ProviderState {
-    source: Box<dyn DataSource>,
+    source: NonNull<dyn DataSource>,
     pending: Pending,
     no_copy: Option<(*const u8, usize)>,
     panic: Option<Box<dyn Any + Send>>,
 }
 
+impl Drop for ProviderState {
+    fn drop(&mut self) {
+        // SAFETY: this pointer owns the source allocation returned by Box::into_raw.
+        drop(unsafe { Box::from_raw(self.source.as_ptr()) });
+    }
+}
+
 /// DATA provider backed by a [`DataSource`]. The state lives in a raw box allocation,
 /// so `source.ptr` stays valid across moves and field access.
 pub struct DataProvider {
-    state: *mut ProviderState,
+    state: NonNull<ProviderState>,
     raw: RawDataProvider,
 }
 
@@ -88,10 +103,19 @@ pub struct DataProvider {
 impl DataProvider {
     /// Wraps a caller-supplied source.
     pub fn new<S: DataSource + 'static>(source: S) -> Self {
-        let state = Box::into_raw(Box::new(ProviderState { source: Box::new(source), pending: Pending::EMPTY, no_copy: None, panic: None }));
-        let raw = RawDataProvider { source: RawDataSource { ptr: state.cast() }, read_callback: Some(provider_read) };
+        let source: Box<dyn DataSource> = Box::new(source);
+        let allocation = Box::into_raw(source);
+        // SAFETY: converting the owned box yields a non-null pointer; ProviderState
+        // reconstructs the box on drop without retagging pending source bytes.
+        let source = unsafe { NonNull::new_unchecked(allocation) };
+        let allocation = Box::into_raw(Box::new(ProviderState { source, pending: Pending::EMPTY, no_copy: None, panic: None }));
+        // SAFETY: `Box::into_raw` returns a non-null owned allocation.
+        let state = unsafe { NonNull::new_unchecked(allocation) };
+        let raw = RawDataProvider { source: RawDataSource { ptr: state.as_ptr().cast() }, read_callback: Some(provider_read) };
         Self { state, raw }
     }
+    /// Defers its first poll, then ends an empty body after `resume_data`.
+    pub fn deferred() -> Self { Self::new(DeferredSource { waiting: true }) }
     /// Builds a provider that copies `data` into the library buffer.
     pub fn from_vec(data: Vec<u8>) -> Self { Self::new(VecSource { data, pos: 0, no_copy: false }) }
     /// Builds a provider that sends `data` through the session's `send_data` callback.
@@ -101,14 +125,14 @@ impl DataProvider {
     /// Removes the captured panic payload; a payload poisons the provider, and re-submitting it is unsafe.
     pub fn take_panic(&mut self) -> Option<Box<dyn Any + Send>> {
         // SAFETY: `self` owns the allocation and no callback runs at the same time.
-        unsafe { (*self.state).panic.take() }
+        unsafe { (*self.state.as_ptr()).panic.take() }
     }
 }
 
 impl Drop for DataProvider {
     fn drop(&mut self) {
         // SAFETY: `state` came from `Box::into_raw` and is freed exactly once here.
-        drop(unsafe { Box::from_raw(self.state) });
+        drop(unsafe { Box::from_raw(self.state.as_ptr()) });
     }
 }
 
@@ -128,6 +152,19 @@ pub unsafe fn no_copy_chunk(source: *mut RawDataSource) -> Option<(*const u8, us
     let state = unsafe { state.as_ref() }?;
     let (ptr, len) = state.no_copy?;
     if len > 0 { Some((ptr, len)) } else { None }
+}
+
+struct DeferredSource {
+    waiting: bool,
+}
+impl DataSource for DeferredSource {
+    fn read(&mut self, _max_len: usize) -> DataPoll<'_> {
+        if core::mem::replace(&mut self.waiting, false) {
+            DataPoll::Deferred
+        } else {
+            DataPoll::Eof
+        }
+    }
 }
 
 /// Source used by [`DataProvider::from_vec`] and [`DataProvider::from_vec_no_copy`].
@@ -166,7 +203,11 @@ unsafe extern "C" fn provider_read(_session: *mut nghttp2_session, _stream_id: i
     if state.panic.is_some() { return NGHTTP2_ERR_CALLBACK_FAILURE as nghttp2_ssize; }
     if state.pending.len > 0 { return serve_pending(state, buf, len, flags); }
     // Owned return value: the borrow of `state.source` must not escape `catch_unwind`.
-    let result = std::panic::catch_unwind(AssertUnwindSafe(|| match state.source.read(len) {
+    let result = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        // SAFETY: the source allocation is owned by this state. Pending chunks were
+        // drained above, so no retained source borrow overlaps another read.
+        let source = unsafe { state.source.as_mut() };
+        match source.read(len) {
         DataPoll::Copy(chunk) => {
             let take = chunk.len().min(len);
             // SAFETY: `buf` is writable for `len` bytes and `chunk` holds `take`.
@@ -195,7 +236,13 @@ unsafe extern "C" fn provider_read(_session: *mut nghttp2_session, _stream_id: i
             unsafe { *flags |= NGHTTP2_DATA_FLAG_EOF };
             0
         }
+        DataPoll::EofWithTrailers => {
+            // SAFETY: `flags` is the writable out-parameter of this callback.
+            unsafe { *flags |= NGHTTP2_DATA_FLAG_EOF | NGHTTP2_DATA_FLAG_NO_END_STREAM };
+            0
+        }
         DataPoll::Deferred => DEFERRED as nghttp2_ssize,
+        }
     }));
     match result {
         Ok(value) => value,
@@ -270,7 +317,8 @@ impl SettingsEntry {
     pub fn as_raw(&self) -> nghttp2_settings_entry { nghttp2_settings_entry { settings_id: self.id.raw() as i32, value: self.value } }
 }
 
-/// Frame submission on a live `SessionPtr` (forging one is undefined behavior); frames that cannot be sent are abandoned through `on_frame_not_send`.
+/// Frame submission on a live session handle. Frames that cannot be sent are
+/// abandoned through `on_frame_not_send`.
 #[rustfmt::skip]
 pub trait SessionSubmit {
     /// Submits client request HEADERS and returns the new id; a provider suppresses `END_STREAM`.
@@ -388,7 +436,7 @@ fn status(code: i32) -> Result<()> { if code < 0 { Err(Error::from_native(code))
 fn id_result(code: i32) -> Result<i32> { if code < 0 { Err(Error::from_native(code)) } else { Ok(code) } }
 
 #[rustfmt::skip]
-impl SessionSubmit for SessionPtr {
+impl SessionSubmit for SessionPtr<'_> {
     unsafe fn submit_request(&self, pri: Option<&PrioritySpec>, nva: &[HeaderField<'_>], data: Option<&mut DataProvider>, user_data: *mut c_void) -> Result<i32> {
         let raw = raw_headers(nva);
         let provider = data.map_or(ptr::null(), |provider| provider.as_raw());
@@ -497,304 +545,126 @@ impl SessionSubmit for SessionPtr {
     }
 }
 
-#[cfg(test)]
 #[rustfmt::skip]
-mod tests {
-    use core::{ffi::c_void, ptr, sync::atomic::{AtomicBool, Ordering}};
-    use std::sync::Arc;
-
-    use nghttp2_sys::{
-        NGHTTP2_DATA, NGHTTP2_DEFAULT_WEIGHT, NGHTTP2_ERR_INVALID_ARGUMENT,
-        NGHTTP2_ERR_INVALID_STATE, nghttp2_frame, nghttp2_option, nghttp2_option_del,
-        nghttp2_option_new, nghttp2_option_set_no_auto_window_update,
-        nghttp2_pack_extension_callback, nghttp2_send_data_callback, nghttp2_session,
-        nghttp2_session_callbacks, nghttp2_session_callbacks_del, nghttp2_session_callbacks_new,
-        nghttp2_session_callbacks_set_pack_extension_callback,
-        nghttp2_session_callbacks_set_send_data_callback, nghttp2_session_client_new2,
-        nghttp2_session_del, nghttp2_session_mem_recv2, nghttp2_session_mem_send2,
-        nghttp2_session_server_new2,
-    };
-    use super::*;
-    use crate::nv::nv;
-
-    // The `nv!` expansion names the crate as `nghttp2`; this alias puts that name in scope.
-    use crate as nghttp2;
-
-    /// Owns the raw session and callbacks so tests can drive the FFI directly.
-    struct TestSession {
-        session: *mut nghttp2_session,
-        callbacks: *mut nghttp2_session_callbacks,
+impl SessionSubmit for SessionCtx<'_> {
+    unsafe fn submit_request(&self, pri: Option<&PrioritySpec>, nva: &[HeaderField<'_>], data: Option<&mut DataProvider>, user_data: *mut c_void) -> Result<i32> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        // SAFETY: retained buffers and provider ownership follow the caller contract.
+        unsafe { handle.submit_request(pri, nva, data, user_data) }
     }
-
-    impl TestSession {
-        fn new(server: bool, option: *const nghttp2_option, user_data: *mut c_void,
-               send_data: nghttp2_send_data_callback, pack: nghttp2_pack_extension_callback) -> Self {
-            let mut callbacks = ptr::null_mut();
-            // SAFETY: the out-pointer is writable and the call returns an owned object.
-            let rv = unsafe { nghttp2_session_callbacks_new(&raw mut callbacks) };
-            assert_eq!(rv, 0); assert!(!callbacks.is_null());
-            // SAFETY: `callbacks` is live and the setters only store the trampoline.
-            unsafe {
-                nghttp2_session_callbacks_set_send_data_callback(callbacks, send_data);
-                nghttp2_session_callbacks_set_pack_extension_callback(callbacks, pack);
-            }
-            let mut session = ptr::null_mut();
-            // SAFETY: `callbacks` outlives the session; `option` is null or a copied owner.
-            let rv = unsafe {
-                if server { nghttp2_session_server_new2(&raw mut session, callbacks, user_data, option) }
-                else { nghttp2_session_client_new2(&raw mut session, callbacks, user_data, option) }
-            };
-            assert_eq!(rv, 0); assert!(!session.is_null());
-            Self { session, callbacks }
-        }
-        fn handle(&self) -> SessionPtr {
-            match SessionPtr::new(self.session) { Some(handle) => handle, None => panic!("null session") }
-        }
-        /// Serializes queued frames and returns them with the final return code.
-        fn send(&self) -> (Vec<u8>, isize) {
-            let mut out = Vec::new();
-            loop {
-                let mut data: *const u8 = ptr::null();
-                // SAFETY: the session is live and the returned buffer is copied at once.
-                let len = unsafe { nghttp2_session_mem_send2(self.session, &raw mut data) };
-                if len <= 0 { return (out, len); }
-                assert!(!data.is_null());
-                // SAFETY: a positive return guarantees `len` readable bytes.
-                out.extend_from_slice(unsafe { core::slice::from_raw_parts(data, len as usize) });
-            }
-        }
-        fn receive(&self, bytes: &[u8]) {
-            // SAFETY: the session is live and `bytes` is readable during the call.
-            let n = unsafe { nghttp2_session_mem_recv2(self.session, bytes.as_ptr(), bytes.len()) };
-            assert_eq!(n, bytes.len() as isize);
-        }
+    unsafe fn submit_response(&self, stream_id: i32, nva: &[HeaderField<'_>], data: Option<&mut DataProvider>) -> Result<()> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        // SAFETY: retained buffers and provider ownership follow the caller contract.
+        unsafe { handle.submit_response(stream_id, nva, data) }
     }
-
-    impl Drop for TestSession {
-        fn drop(&mut self) {
-            // SAFETY: both pointers are owned here and the session goes first.
-            unsafe { nghttp2_session_del(self.session); nghttp2_session_callbacks_del(self.callbacks); }
-        }
+    unsafe fn submit_headers(&self, flags: FrameFlags, stream_id: i32, pri: Option<&PrioritySpec>, nva: &[HeaderField<'_>], user_data: *mut c_void) -> Result<i32> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        // SAFETY: retained buffers and provider ownership follow the caller contract.
+        unsafe { handle.submit_headers(flags, stream_id, pri, nva, user_data) }
     }
-
-    fn request_headers() -> [HeaderField<'static>; 4] {
-        [nv!(":method", "GET"), nv!(":path", "/"), nv!(":scheme", "https"), nv!(":authority", "example.com")]
+    unsafe fn submit_data(&self, flags: FrameFlags, stream_id: i32, data: &mut DataProvider) -> Result<()> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        // SAFETY: retained buffers and provider ownership follow the caller contract.
+        unsafe { handle.submit_data(flags, stream_id, data) }
     }
-
-    /// Submits a request on a fresh client and drives one send pass.
-    fn run_request(provider: Option<&mut DataProvider>) -> (Vec<u8>, isize) {
-        let client = TestSession::new(false, ptr::null(), ptr::null_mut(), None, None);
-        let request = request_headers();
-        // SAFETY: the session and provider are live for the call and the send pass.
-        let id = unsafe { client.handle().submit_request(None, &request, provider, ptr::null_mut()) };
-        assert_eq!(id, Ok(1));
-        client.send()
+    unsafe fn submit_trailer(&self, stream_id: i32, nva: &[HeaderField<'_>]) -> Result<()> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        // SAFETY: retained buffers and provider ownership follow the caller contract.
+        unsafe { handle.submit_trailer(stream_id, nva) }
     }
-
-    #[test]
-    fn submit_request_response_headers_and_trailer() {
-        let client = TestSession::new(false, ptr::null(), ptr::null_mut(), None, None);
-        let h = client.handle();
-        let request = request_headers();
-        // SAFETY: the session is live, the headers are static, and no provider is passed.
-        assert_eq!(unsafe { h.submit_request(None, &request, None, ptr::null_mut()) }, Ok(1));
-        let (wire, code) = client.send();
-        assert_eq!(code, 0);
-        let server = TestSession::new(true, ptr::null(), ptr::null_mut(), None, None);
-        server.receive(&wire);
-        // SAFETY: the session is live and the response headers are static.
-        assert_eq!(unsafe { server.handle().submit_response(1, &[nv!(":status", "200")], None) }, Ok(()));
-        let (response, code) = server.send();
-        assert_eq!(code, 0);
-        assert!(!response.is_empty(), "response was not serialized");
-        // SAFETY: `request` is static and the session is live.
-        assert!(matches!(unsafe { h.submit_headers(FrameFlags::NONE, -1, None, &request, ptr::null_mut()) }, Ok(id) if id > 0));
-        assert_eq!(client.send().1, 0);
-        // SAFETY: the trailer headers are static and the session is live.
-        assert_eq!(unsafe { h.submit_trailer(1, &[nv!("x-trailer", "done")]) }, Ok(()));
+    fn submit_rst_stream(&self, flags: FrameFlags, stream_id: i32, error_code: ErrorCode) -> Result<()> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        handle.submit_rst_stream(flags, stream_id, error_code)
     }
-
-    #[test]
-    fn control_frames_follow_session_role() {
-        let client = TestSession::new(false, ptr::null(), ptr::null_mut(), None, None);
-        let h = client.handle();
-        let request = request_headers();
-        // SAFETY: the session is live and the request headers are static.
-        assert_eq!(unsafe { h.submit_request(None, &request, None, ptr::null_mut()) }, Ok(1));
-        assert_eq!(client.send().1, 0);
-        assert_eq!(h.submit_rst_stream(FrameFlags::NONE, 1, ErrorCode::CANCEL), Ok(()));
-        assert_eq!(h.submit_settings(&[SettingsEntry::new(SettingsId::MAX_CONCURRENT_STREAMS, 100)]), Ok(()));
-        assert_eq!((h.submit_ping(FrameFlags::NONE, Some(&[1, 2, 3, 4, 5, 6, 7, 8])), h.submit_goaway(FrameFlags::NONE, 0, ErrorCode::NO_ERROR, b"bye")), (Ok(()), Ok(())));
-        assert_eq!((h.submit_window_update(FrameFlags::NONE, 0, 1000), h.submit_priority_update(FrameFlags::NONE, 1, b"u=1")), (Ok(()), Ok(())));
-        // Stream 1 exists but no provider deferred it.
-        assert_eq!(h.resume_data(1), Err(Error::from_native(NGHTTP2_ERR_INVALID_ARGUMENT)));
-        assert_eq!(h.set_local_window_size(FrameFlags::NONE, 0, 100_000), Ok(()));
-        let state = Error::from_native(NGHTTP2_ERR_INVALID_STATE);
-        assert_eq!((h.change_extpri(1, ExtPri::default(), false), h.extpri(1)), (Err(state), Err(state)));
-        assert_eq!((h.submit_altsvc(FrameFlags::NONE, 0, b"https://e.example", b"h3"), h.submit_origin(FrameFlags::NONE, &[b"https://e.example"])), (Err(state), Err(state)));
-        assert_eq!(h.submit_shutdown_notice(), Err(state));
-        let server = TestSession::new(true, ptr::null(), ptr::null_mut(), None, None);
-        let h = server.handle();
-        // Without a pending SETTINGS_NO_RFC7540_PRIORITIES value the server ignores both
-        // extensible-priority calls, even for a missing stream.
-        assert_eq!((h.change_extpri(1, ExtPri::default(), false), h.extpri(1)), (Ok(()), Ok(ExtPri::default())));
-        assert_eq!(h.submit_altsvc(FrameFlags::NONE, 0, b"https://e.example", b"h3"), Ok(()));
-        assert_eq!(h.submit_origin(FrameFlags::NONE, &[b"https://e.example"]), Ok(()));
-        assert_eq!(h.submit_shutdown_notice(), Ok(()));
-        let mut option = ptr::null_mut();
-        // SAFETY: the out-pointer is writable; the option is deleted after the constructor
-        // copies its settings.
-        unsafe {
-            assert_eq!(nghttp2_option_new(&raw mut option), 0);
-            nghttp2_option_set_no_auto_window_update(option, 1);
-        }
-        let consumable = TestSession::new(false, option, ptr::null_mut(), None, None);
-        // SAFETY: the session constructor copied the option settings.
-        unsafe { nghttp2_option_del(option) };
-        let h = consumable.handle();
-        assert_eq!((h.consume(1, 10), h.consume_connection(10), h.consume_stream(1, 10)), (Ok(()), Ok(()), Ok(())));
-        assert_eq!(TestSession::new(false, ptr::null(), ptr::null_mut(), None, None).handle().consume_connection(10), Err(state));
-        // Extension frames need a pack callback, and reject reserved frame types first.
-        let mut payload = 0u8;
-        let without = TestSession::new(false, ptr::null(), ptr::null_mut(), None, None);
-        // SAFETY: the session is live; the frame is rejected before `payload` is stored.
-        let result = unsafe { without.handle().submit_extension(FrameType::ALTSVC, FrameFlags::NONE, 0, (&raw mut payload).cast()) };
-        assert_eq!(result, Err(Error::from_native(NGHTTP2_ERR_INVALID_STATE)));
-        let with = TestSession::new(false, ptr::null(), ptr::null_mut(), None, Some(pack_extension));
-        // SAFETY: the session is live and the frame is never serialized.
-        let result = unsafe { with.handle().submit_extension(FrameType::ALTSVC, FrameFlags::NONE, 0, (&raw mut payload).cast()) };
-        assert_eq!(result, Ok(()));
+    fn submit_settings(&self, entries: &[SettingsEntry]) -> Result<()> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        handle.submit_settings(entries)
     }
-
-    unsafe extern "C" fn pack_extension(_session: *mut nghttp2_session, _buf: *mut u8, _len: usize,
-                                        _frame: *const nghttp2_frame, _user_data: *mut c_void) -> isize { 0 }
-
-    struct TestSource { ready: Option<Arc<AtomicBool>>, chunk: &'static [u8], step: u8, panics: bool }
-
-    impl DataSource for TestSource {
-        fn read(&mut self, _max_len: usize) -> DataPoll<'_> {
-            if self.panics { panic!("provider boom"); }
-            if let Some(ready) = &self.ready && !ready.load(Ordering::SeqCst) { return DataPoll::Deferred; }
-            if self.step > 0 { return DataPoll::Eof; }
-            self.step = 1;
-            DataPoll::Copy(self.chunk)
-        }
+    fn submit_ping(&self, flags: FrameFlags, opaque: Option<&[u8; 8]>) -> Result<()> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        handle.submit_ping(flags, opaque)
     }
-
-    #[test]
-    fn copy_provider_splits_payload_at_the_default_max_frame_size() {
-        let payload = vec![0x5au8; 20_000];
-        let (wire, code) = run_request(Some(&mut DataProvider::from_vec(payload.clone())));
-        // Upstream caps one DATA payload at the remote SETTINGS_MAX_FRAME_SIZE, 16384 bytes.
-        let data = &wire[wire.len() - (9 + 16_384 + 9 + 3_616 + 9)..];
-        let second = 9 + 16_384;
-        assert_eq!((&data[..5], &data[second..second + 5]), (&[0x00u8, 0x40, 0x00, NGHTTP2_DATA as u8, 0][..], &[0x00u8, 0x0e, 0x20, NGHTTP2_DATA as u8, 0][..]));
-        assert_eq!((&data[9..second], &data[second + 9..second + 9 + 3_616]), (&payload[..16_384], &payload[16_384..]));
-        assert_eq!((code, &data[data.len() - 9..]), (0, &[0u8, 0, 0, NGHTTP2_DATA as u8, FrameFlags::END_STREAM.bits(), 0, 0, 0, 1][..]));
+    fn submit_goaway(&self, flags: FrameFlags, last_stream_id: i32, error_code: ErrorCode, opaque: &[u8]) -> Result<()> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        handle.submit_goaway(flags, last_stream_id, error_code, opaque)
     }
-
-    #[test]
-    fn empty_payload_sends_a_zero_length_data_frame_with_end_stream() {
-        let (wire, code) = run_request(Some(&mut DataProvider::from_vec(Vec::new())));
-        assert_eq!((code, &wire[wire.len() - 9..]), (0, &[0u8, 0, 0, NGHTTP2_DATA as u8, FrameFlags::END_STREAM.bits(), 0, 0, 0, 1][..]));
+    fn submit_window_update(&self, flags: FrameFlags, stream_id: i32, increment: i32) -> Result<()> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        handle.submit_window_update(flags, stream_id, increment)
     }
-
-    unsafe extern "C" fn capture(_session: *mut nghttp2_session, _frame: *mut nghttp2_frame,
-                                 framehd: *const u8, _length: usize, source: *mut RawDataSource,
-                                 user_data: *mut c_void) -> i32 {
-        // SAFETY: the test installs a live Vec<u8> at `user_data` for the session.
-        let captured = unsafe { &mut *user_data.cast::<Vec<u8>>() };
-        // SAFETY: nghttp2 passes a nine-byte frame header valid for the call.
-        captured.extend_from_slice(unsafe { core::slice::from_raw_parts(framehd, 9) });
-        // SAFETY: `source` belongs to the provider that produced this DATA frame.
-        if let Some((ptr, len)) = unsafe { no_copy_chunk(source) } {
-            // SAFETY: the chunk stays valid until this callback returns.
-            captured.extend_from_slice(unsafe { core::slice::from_raw_parts(ptr, len) });
-        }
-        0
+    fn submit_shutdown_notice(&self) -> Result<()> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        handle.submit_shutdown_notice()
     }
-
-    #[test]
-    fn no_copy_provider_sends_through_the_send_data_callback() {
-        let mut captured = Vec::new();
-        {
-            let mut provider = DataProvider::from_vec_no_copy(b"no-copy-data".to_vec());
-            let client = TestSession::new(false, ptr::null(), (&raw mut captured).cast(), Some(capture), None);
-            let request = request_headers();
-            // SAFETY: the session and provider are live and the provider outlives `send`.
-            let id = unsafe { client.handle().submit_request(None, &request, Some(&mut provider), ptr::null_mut()) };
-            assert_eq!(id, Ok(1));
-            let (wire, code) = client.send();
-            assert_eq!(code, 0);
-            let tail = wire.len() - 9;
-            assert_eq!((wire[tail + 3], wire[tail + 4]), (NGHTTP2_DATA as u8, FrameFlags::END_STREAM.bits()));
-        }
-        assert_eq!((captured.len(), captured[3]), (9 + 12, NGHTTP2_DATA as u8));
-        assert_eq!(&captured[0..3], &[0u8, 0, 12]);
-        assert_eq!(&captured[9..21], b"no-copy-data");
+    fn submit_altsvc(&self, flags: FrameFlags, stream_id: i32, origin: &[u8], field_value: &[u8]) -> Result<()> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        handle.submit_altsvc(flags, stream_id, origin, field_value)
     }
-
-    #[test]
-    fn no_copy_provider_splits_payload_across_send_data_calls() {
-        let mut captured = Vec::new();
-        let mut provider = DataProvider::from_vec_no_copy(vec![0xa5u8; 20_000]);
-        let client = TestSession::new(false, ptr::null(), (&raw mut captured).cast(), Some(capture), None);
-        // SAFETY: the session and provider are live and the provider outlives `send`.
-        let id = unsafe { client.handle().submit_request(None, &request_headers(), Some(&mut provider), ptr::null_mut()) };
-        assert_eq!(id, Ok(1)); assert_eq!(client.send().1, 0);
-        // Each send_data call contributes a nine-byte frame header before its chunk.
-        assert_eq!((&captured[..5], &captured[9 + 16_384..9 + 16_384 + 5]), (&[0x00u8, 0x40, 0x00, NGHTTP2_DATA as u8, 0][..], &[0x00u8, 0x0e, 0x20, NGHTTP2_DATA as u8, 0][..]));
-        assert_eq!(captured.iter().filter(|&&byte| byte == 0xa5).count(), 20_000);
+    fn submit_origin(&self, flags: FrameFlags, origins: &[&[u8]]) -> Result<()> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        handle.submit_origin(flags, origins)
     }
-
-    #[test]
-    fn deferred_provider_waits_for_resume_data() {
-        let ready = Arc::new(AtomicBool::new(false));
-        let mut provider = DataProvider::new(TestSource { ready: Some(Arc::clone(&ready)), chunk: b"deferred", step: 0, panics: false });
-        let client = TestSession::new(false, ptr::null(), ptr::null_mut(), None, None);
-        let request = request_headers();
-        // SAFETY: the session and provider are live and the provider outlives both sends.
-        let id = unsafe { client.handle().submit_request(None, &request, Some(&mut provider), ptr::null_mut()) };
-        assert_eq!(id, Ok(1));
-        let (wire, code) = client.send();
-        assert_eq!(code, 0);
-        assert!(!wire.windows(8).any(|window| window == b"deferred"), "sent before resume");
-        assert_eq!(client.handle().resume_data(1), Ok(()));
-        ready.store(true, Ordering::SeqCst);
-        let (wire, code) = client.send();
-        assert_eq!(code, 0);
-        assert!(wire.windows(8).any(|window| window == b"deferred"), "not sent after resume");
+    fn submit_priority_update(&self, flags: FrameFlags, stream_id: i32, field_value: &[u8]) -> Result<()> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        handle.submit_priority_update(flags, stream_id, field_value)
     }
-
-    #[test]
-    fn provider_panic_is_reported_as_callback_failure() {
-        let mut provider = DataProvider::new(TestSource { ready: None, chunk: b"", step: 0, panics: true });
-        let (_, code) = run_request(Some(&mut provider));
-        assert_eq!(code, NGHTTP2_ERR_CALLBACK_FAILURE as isize);
-        let Some(payload) = provider.take_panic() else { panic!("panic payload missing") };
-        assert_eq!(payload.downcast_ref::<&str>(), Some(&"provider boom"));
+    unsafe fn submit_extension(&self, type_: FrameType, flags: FrameFlags, stream_id: i32, payload: *mut c_void) -> Result<()> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        // SAFETY: retained buffers and provider ownership follow the caller contract.
+        unsafe { handle.submit_extension(type_, flags, stream_id, payload) }
     }
-
-    #[test]
-    fn priority_and_settings_convert_to_the_native_layout() {
-        let spec = PrioritySpec::new(3, 200, true);
-        assert_eq!((spec.dependency(), spec.weight(), spec.exclusive()), (3, 200, true));
-        // SAFETY: `as_raw` points at the descriptor owned by `spec`, still alive.
-        let raw = unsafe { *spec.as_raw() };
-        assert_eq!((raw.stream_id, raw.weight, raw.exclusive), (3, 200, 1));
-        let default = PrioritySpec::default_for(7);
-        assert_eq!((default.dependency(), default.weight(), default.exclusive()), (7, NGHTTP2_DEFAULT_WEIGHT as i32, false));
-        let entry = SettingsEntry::new(SettingsId::MAX_FRAME_SIZE, 16_384);
-        assert_eq!((entry.id(), entry.value()), (SettingsId::MAX_FRAME_SIZE, 16_384));
-        assert_eq!((entry.as_raw().settings_id, entry.as_raw().value), (5, 16_384));
-        let provider = DataProvider::from_vec(b"abc".to_vec());
-        let raw = provider.as_raw();
-        assert!(!raw.is_null());
-        // SAFETY: the provider is alive and `as_raw` points at its descriptor.
-        let before = unsafe { (*raw).source.ptr };
-        assert!(!before.is_null());
-        let moved = provider;
-        // SAFETY: `moved` now owns the descriptor, which is still alive.
-        assert_eq!(unsafe { (*moved.as_raw()).source.ptr }, before);
+    fn change_extpri(&self, stream_id: i32, extpri: ExtPri, ignore_client_signal: bool) -> Result<()> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        handle.change_extpri(stream_id, extpri, ignore_client_signal)
+    }
+    fn extpri(&self, stream_id: i32) -> Result<ExtPri> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        handle.extpri(stream_id)
+    }
+    fn consume(&self, stream_id: i32, size: usize) -> Result<()> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        handle.consume(stream_id, size)
+    }
+    fn consume_connection(&self, size: usize) -> Result<()> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        handle.consume_connection(size)
+    }
+    fn consume_stream(&self, stream_id: i32, size: usize) -> Result<()> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        handle.consume_stream(stream_id, size)
+    }
+    fn set_local_window_size(&self, flags: FrameFlags, stream_id: i32, window_size: i32) -> Result<()> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        handle.set_local_window_size(flags, stream_id, window_size)
+    }
+    fn resume_data(&self, stream_id: i32) -> Result<()> {
+        // SAFETY: the context guarantees a live session for this borrow.
+        let handle = unsafe { SessionPtr::from_raw(NonNull::new_unchecked(self.as_ptr())) };
+        handle.resume_data(stream_id)
     }
 }
+
+#[cfg(test)]
+#[path = "../tests/support/submit.rs"]
+mod tests;

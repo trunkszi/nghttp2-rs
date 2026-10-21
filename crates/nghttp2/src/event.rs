@@ -18,7 +18,7 @@ use std::collections::VecDeque;
 pub use nghttp2_sys::{nghttp2_frame, nghttp2_frame_hd};
 
 use crate::{
-    callbacks::SessionHandler,
+    callbacks::{CallbackError, CallbackResult, Frame, SessionHandler},
     context::SessionCtx,
     error::NgHttp2Error,
     types::{ErrorCode, FrameFlags, FrameType, HeadersCategory},
@@ -87,6 +87,15 @@ pub enum SessionEvent {
         /// Stream the frame belongs to; zero for connection-level frames.
         stream_id: i32,
     },
+    /// A queued frame was abandoned before transmission.
+    FrameNotSend {
+        /// Stream the frame belongs to.
+        stream_id: i32,
+        /// Native frame type byte.
+        frame_type: u8,
+        /// Native reason the frame could not be sent.
+        lib_error_code: i32,
+    },
     /// A stream was closed.
     StreamClose {
         /// Closed stream.
@@ -128,30 +137,51 @@ pub enum SessionEvent {
     },
 }
 
-/// Queue of [`SessionEvent`] values filled by a session's callbacks.
+/// Queue of owned callback notifications, bounded by event count and payload bytes.
 ///
-/// `EventCollector` never blocks and never allocates on behalf of the caller beyond
-/// owning the event payloads; it copies exactly the bytes each callback reports.
-#[derive(Debug, Default)]
+/// Admission failure preserves every queued event and returns a callback failure.
+/// Payload budgets include header names/values, DATA, GOAWAY debug bytes and error
+/// messages; fixed-size event storage is bounded separately by the event limit.
+#[derive(Debug)]
 pub struct EventCollector {
     events: VecDeque<SessionEvent>,
+    max_events: usize,
+    max_owned_bytes: usize,
+    owned_bytes: usize,
+}
+
+impl Default for EventCollector {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl EventCollector {
-    /// Creates an empty collector.
+    /// Creates a collector limited to 4096 events and 16 MiB of owned payloads.
     #[must_use]
     pub const fn new() -> Self {
+        Self::with_limits(4096, 16 * 1024 * 1024)
+    }
+
+    /// Creates a collector with independent event-count and payload-byte limits.
+    /// A zero event limit rejects all notifications; zero bytes allows events
+    /// without variable-length payloads.
+    #[must_use]
+    pub const fn with_limits(max_events: usize, max_owned_bytes: usize) -> Self {
         Self {
             events: VecDeque::new(),
+            max_events,
+            max_owned_bytes,
+            owned_bytes: 0,
         }
     }
 
-    /// Removes and returns the oldest pending event.
-    ///
-    /// Returns `None` when no events are pending.
+    /// Removes the oldest event and releases its admission budget.
     #[must_use]
     pub fn next_event(&mut self) -> Option<SessionEvent> {
-        self.events.pop_front()
+        let event = self.events.pop_front()?;
+        self.owned_bytes -= event.owned_bytes();
+        Some(event)
     }
 
     /// Returns whether no events are pending.
@@ -166,10 +196,61 @@ impl EventCollector {
         self.events.len()
     }
 
-    /// Drops every pending event, keeping the allocated capacity.
+    /// Returns the total variable-length payload bytes held by queued events.
+    #[must_use]
+    pub fn owned_bytes(&self) -> usize {
+        self.owned_bytes
+    }
+
+    /// Drops every pending event and releases its budget, retaining queue capacity.
     pub fn clear(&mut self) {
         self.events.clear();
+        self.owned_bytes = 0;
     }
+
+    fn admit(&mut self, bytes: usize) -> CallbackResult {
+        let total = self
+            .owned_bytes
+            .checked_add(bytes)
+            .ok_or(CallbackError::Failure)?;
+        if self.events.len() >= self.max_events || total > self.max_owned_bytes {
+            return Err(CallbackError::Failure);
+        }
+        self.events
+            .try_reserve(1)
+            .map_err(|_| CallbackError::Failure)
+    }
+
+    fn commit(&mut self, event: SessionEvent) {
+        self.owned_bytes += event.owned_bytes();
+        self.events.push_back(event);
+    }
+
+    fn push(&mut self, event: SessionEvent) -> CallbackResult {
+        self.admit(event.owned_bytes())?;
+        self.commit(event);
+        Ok(())
+    }
+}
+
+impl SessionEvent {
+    fn owned_bytes(&self) -> usize {
+        match self {
+            Self::Header { name, value, .. } => name.len() + value.len(),
+            Self::DataChunk { data, .. } => data.len(),
+            Self::GoAway { opaque_data, .. } => opaque_data.len(),
+            Self::Error { message, .. } => message.len(),
+            _ => 0,
+        }
+    }
+}
+
+fn copy_payload(bytes: &[u8]) -> Result<Vec<u8>, CallbackError> {
+    let mut copy = Vec::new();
+    copy.try_reserve_exact(bytes.len())
+        .map_err(|_| CallbackError::Failure)?;
+    copy.extend_from_slice(bytes);
+    Ok(copy)
 }
 
 /// Resolves the stream a header block belongs to.
@@ -178,7 +259,7 @@ impl EventCollector {
 /// frames. A push promise announces the request headers of the promised stream, so
 /// its events carry the promised stream identifier rather than the associated
 /// stream the promise arrived on.
-fn header_stream_id(frame: &nghttp2_frame) -> i32 {
+fn header_stream_id(frame: &Frame) -> i32 {
     // SAFETY: every member of `nghttp2_frame` starts with `nghttp2_frame_hd` at
     // offset zero, so the tag is readable whichever member is active.
     let hd = unsafe { frame.hd };
@@ -192,22 +273,29 @@ fn header_stream_id(frame: &nghttp2_frame) -> i32 {
 }
 
 /// Copies the debug payload of a `GOAWAY` frame.
-fn copy_goaway_opaque_data(goaway: &nghttp2_sys::nghttp2_goaway) -> Vec<u8> {
+fn copy_goaway_opaque_data(goaway: &nghttp2_sys::nghttp2_goaway) -> Result<Vec<u8>, CallbackError> {
     if goaway.opaque_data.is_null() || goaway.opaque_data_len == 0 {
-        return Vec::new();
+        return Ok(Vec::new());
     }
     // SAFETY: for a received `GOAWAY` frame, `opaque_data` points at
     // `opaque_data_len` payload bytes that remain valid for the duration of the
     // callback; the bytes are copied before the callback returns.
-    unsafe { core::slice::from_raw_parts(goaway.opaque_data, goaway.opaque_data_len) }.to_vec()
+    copy_payload(unsafe { core::slice::from_raw_parts(goaway.opaque_data, goaway.opaque_data_len) })
 }
 
 impl SessionHandler for EventCollector {
-    fn on_frame_recv(&mut self, _ctx: &mut SessionCtx<'_>, frame: &nghttp2_frame) {
+    fn on_frame_recv(&mut self, _ctx: &mut SessionCtx<'_>, frame: &Frame) -> CallbackResult {
         // SAFETY: every member of `nghttp2_frame` starts with `nghttp2_frame_hd` at
         // offset zero, so the tag and flags are readable whichever member is active.
         let hd = unsafe { frame.hd };
         let frame_type = FrameType::from_raw(hd.type_);
+        let payload_bytes = if frame_type == FrameType::GOAWAY {
+            // SAFETY: the validated frame tag selects the initialized GOAWAY member.
+            unsafe { frame.goaway.opaque_data_len }
+        } else {
+            0
+        };
+        self.admit(payload_bytes)?;
         let event = match frame_type {
             FrameType::GOAWAY => {
                 // SAFETY: `hd.type_` is `NGHTTP2_GOAWAY`, which selects the `goaway`
@@ -216,7 +304,7 @@ impl SessionHandler for EventCollector {
                 SessionEvent::GoAway {
                     last_stream_id: goaway.last_stream_id,
                     error_code: ErrorCode::from_raw(goaway.error_code),
-                    opaque_data: copy_goaway_opaque_data(&goaway),
+                    opaque_data: copy_goaway_opaque_data(&goaway)?,
                 }
             }
             FrameType::PING => {
@@ -246,21 +334,37 @@ impl SessionHandler for EventCollector {
                 stream_id: hd.stream_id,
             },
         };
-        self.events.push_back(event);
+        self.commit(event);
+        Ok(())
     }
 
-    fn on_frame_send(&mut self, _ctx: &mut SessionCtx<'_>, frame: &nghttp2_frame) {
+    fn on_frame_send(&mut self, _ctx: &mut SessionCtx<'_>, frame: &Frame) -> CallbackResult {
         // SAFETY: every member of `nghttp2_frame` starts with `nghttp2_frame_hd` at
         // offset zero, so the tag and flags are readable whichever member is active.
         let hd = unsafe { frame.hd };
-        self.events.push_back(SessionEvent::FrameSend {
+        self.push(SessionEvent::FrameSend {
             frame_type: FrameType::from_raw(hd.type_),
             flags: hd.flags,
             stream_id: hd.stream_id,
-        });
+        })
     }
 
-    fn on_begin_headers(&mut self, _ctx: &mut SessionCtx<'_>, frame: &nghttp2_frame) {
+    fn on_frame_not_send(
+        &mut self,
+        _ctx: &mut SessionCtx<'_>,
+        frame: &Frame,
+        error: NgHttp2Error,
+    ) -> CallbackResult {
+        // SAFETY: every validated frame has an initialized common header.
+        let hd = unsafe { frame.hd };
+        self.push(SessionEvent::FrameNotSend {
+            stream_id: hd.stream_id,
+            frame_type: hd.type_,
+            lib_error_code: error.raw(),
+        })
+    }
+
+    fn on_begin_headers(&mut self, _ctx: &mut SessionCtx<'_>, frame: &Frame) -> CallbackResult {
         // SAFETY: every member of `nghttp2_frame` starts with `nghttp2_frame_hd` at
         // offset zero, so the tag is readable whichever member is active.
         let hd = unsafe { frame.hd };
@@ -277,26 +381,32 @@ impl SessionHandler for EventCollector {
             let category = unsafe { frame.headers.cat };
             (hd.stream_id, HeadersCategory::from_raw(category))
         };
-        self.events.push_back(SessionEvent::BeginHeaders {
+        self.push(SessionEvent::BeginHeaders {
             stream_id,
             category,
-        });
+        })
     }
 
     fn on_header(
         &mut self,
         _ctx: &mut SessionCtx<'_>,
-        frame: &nghttp2_frame,
+        frame: &Frame,
         name: &[u8],
         value: &[u8],
         flags: u8,
-    ) {
-        self.events.push_back(SessionEvent::Header {
+    ) -> CallbackResult {
+        let bytes = name
+            .len()
+            .checked_add(value.len())
+            .ok_or(CallbackError::Failure)?;
+        self.admit(bytes)?;
+        self.commit(SessionEvent::Header {
             stream_id: header_stream_id(frame),
-            name: name.to_vec(),
-            value: value.to_vec(),
+            name: copy_payload(name)?,
+            value: copy_payload(value)?,
             flags,
         });
+        Ok(())
     }
 
     fn on_data_chunk_recv(
@@ -305,12 +415,14 @@ impl SessionHandler for EventCollector {
         flags: u8,
         stream_id: i32,
         data: &[u8],
-    ) {
-        self.events.push_back(SessionEvent::DataChunk {
+    ) -> CallbackResult {
+        self.admit(data.len())?;
+        self.commit(SessionEvent::DataChunk {
             stream_id,
             flags,
-            data: data.to_vec(),
+            data: copy_payload(data)?,
         });
+        Ok(())
     }
 
     fn on_stream_close(
@@ -318,11 +430,11 @@ impl SessionHandler for EventCollector {
         _ctx: &mut SessionCtx<'_>,
         stream_id: i32,
         error_code: ErrorCode,
-    ) {
-        self.events.push_back(SessionEvent::StreamClose {
+    ) -> CallbackResult {
+        self.push(SessionEvent::StreamClose {
             stream_id,
             error_code,
-        });
+        })
     }
 
     fn error_callback2(
@@ -330,330 +442,20 @@ impl SessionHandler for EventCollector {
         _ctx: &mut SessionCtx<'_>,
         lib_error: NgHttp2Error,
         message: &[u8],
-    ) {
-        self.events.push_back(SessionEvent::Error {
+    ) -> CallbackResult {
+        self.admit(message.len())?;
+        self.commit(SessionEvent::Error {
             code: lib_error,
-            message: message.to_vec(),
+            message: copy_payload(message)?,
         });
+        Ok(())
     }
 }
 
 #[cfg(test)]
-mod tests {
-    use nghttp2_sys::{
-        NGHTTP2_CANCEL, NGHTTP2_DATA, NGHTTP2_ERR_INVALID_FRAME, NGHTTP2_GOAWAY,
-        NGHTTP2_HCAT_RESPONSE, NGHTTP2_HEADERS, NGHTTP2_NO_ERROR, NGHTTP2_PING,
-        NGHTTP2_PUSH_PROMISE, NGHTTP2_SETTINGS, NGHTTP2_WINDOW_UPDATE,
-    };
+#[path = "../tests/support/event_existing.rs"]
+mod tests;
 
-    use super::*;
-
-    /// Builds a header whose `length` and `reserved` fields are irrelevant here.
-    fn frame_hd(type_: u8, flags: u8, stream_id: i32) -> nghttp2_frame_hd {
-        nghttp2_frame_hd {
-            length: 0,
-            stream_id,
-            type_,
-            flags,
-            reserved: 0,
-        }
-    }
-
-    fn headers_frame(stream_id: i32, category: u32, flags: u8) -> nghttp2_frame {
-        nghttp2_frame {
-            headers: nghttp2_sys::nghttp2_headers {
-                hd: frame_hd(NGHTTP2_HEADERS as u8, flags, stream_id),
-                padlen: 0,
-                pri_spec: nghttp2_sys::nghttp2_priority_spec {
-                    stream_id: 0,
-                    weight: 16,
-                    exclusive: 0,
-                },
-                nva: core::ptr::null_mut(),
-                nvlen: 0,
-                cat: category,
-            },
-        }
-    }
-
-    fn push_promise_frame(stream_id: i32, promised_stream_id: i32) -> nghttp2_frame {
-        nghttp2_frame {
-            push_promise: nghttp2_sys::nghttp2_push_promise {
-                hd: frame_hd(NGHTTP2_PUSH_PROMISE as u8, 0, stream_id),
-                padlen: 0,
-                nva: core::ptr::null_mut(),
-                nvlen: 0,
-                promised_stream_id,
-                reserved: 0,
-            },
-        }
-    }
-
-    fn data_frame(stream_id: i32, flags: u8) -> nghttp2_frame {
-        nghttp2_frame {
-            data: nghttp2_sys::nghttp2_data {
-                hd: frame_hd(NGHTTP2_DATA as u8, flags, stream_id),
-                padlen: 0,
-            },
-        }
-    }
-
-    fn goaway_frame(
-        last_stream_id: i32,
-        error_code: u32,
-        opaque_data: *mut u8,
-        opaque_data_len: usize,
-    ) -> nghttp2_frame {
-        nghttp2_frame {
-            goaway: nghttp2_sys::nghttp2_goaway {
-                hd: frame_hd(NGHTTP2_GOAWAY as u8, 0, 0),
-                last_stream_id,
-                error_code,
-                opaque_data,
-                opaque_data_len,
-                reserved: 0,
-            },
-        }
-    }
-
-    fn ping_frame(ack: bool, opaque_data: [u8; 8]) -> nghttp2_frame {
-        let flags = if ack { FrameFlags::ACK.bits() } else { 0 };
-        nghttp2_frame {
-            ping: nghttp2_sys::nghttp2_ping {
-                hd: frame_hd(NGHTTP2_PING as u8, flags, 0),
-                opaque_data,
-            },
-        }
-    }
-
-    fn settings_frame(flags: u8) -> nghttp2_frame {
-        nghttp2_frame {
-            settings: nghttp2_sys::nghttp2_settings {
-                hd: frame_hd(NGHTTP2_SETTINGS as u8, flags, 0),
-                niv: 0,
-                iv: core::ptr::null_mut(),
-            },
-        }
-    }
-
-    fn window_update_frame(stream_id: i32, increment: i32) -> nghttp2_frame {
-        nghttp2_frame {
-            window_update: nghttp2_sys::nghttp2_window_update {
-                hd: frame_hd(NGHTTP2_WINDOW_UPDATE as u8, 0, stream_id),
-                window_size_increment: increment,
-                reserved: 0,
-            },
-        }
-    }
-
-    /// Builds a context over a dangling pointer that is never dereferenced.
-    fn test_ctx() -> SessionCtx<'static> {
-        let raw = core::ptr::NonNull::<nghttp2_sys::nghttp2_session>::dangling().as_ptr();
-        // SAFETY: the pointer is dangling and never dereferenced: `SessionCtx` only
-        // stores it, and every collector method ignores the handle.
-        unsafe { SessionCtx::from_raw(raw) }.expect("dangling session pointer is non-null")
-    }
-
-    #[test]
-    fn frame_type_reads_the_header_byte() {
-        let hd = RawFrameHeader {
-            length: 0,
-            stream_id: 0,
-            type_: 4,
-            flags: 0,
-            reserved: 0,
-        };
-        assert_eq!(frame_type(&hd), 4);
-    }
-
-    #[test]
-    fn collector_records_callbacks_in_order() {
-        let mut collector = EventCollector::new();
-        let mut ctx = test_ctx();
-
-        let headers = headers_frame(1, NGHTTP2_HCAT_RESPONSE, 0);
-        collector.on_begin_headers(&mut ctx, &headers);
-        collector.on_header(&mut ctx, &headers, b":status", b"200", 0);
-        collector.on_data_chunk_recv(&mut ctx, FrameFlags::END_STREAM.bits(), 1, b"hello");
-
-        let mut opaque = *b"seen";
-        let goaway = goaway_frame(7, NGHTTP2_CANCEL, opaque.as_mut_ptr(), opaque.len());
-        collector.on_frame_recv(&mut ctx, &goaway);
-
-        let ping = ping_frame(false, *b"pingpong");
-        collector.on_frame_recv(&mut ctx, &ping);
-
-        let settings = settings_frame(FrameFlags::ACK.bits());
-        collector.on_frame_recv(&mut ctx, &settings);
-
-        let window_update = window_update_frame(3, 4096);
-        collector.on_frame_recv(&mut ctx, &window_update);
-
-        let data = data_frame(5, 0);
-        collector.on_frame_recv(&mut ctx, &data);
-
-        collector.on_frame_send(&mut ctx, &window_update);
-        collector.on_stream_close(&mut ctx, 9, ErrorCode::CANCEL);
-        collector.error_callback2(
-            &mut ctx,
-            NgHttp2Error::from_raw(NGHTTP2_ERR_INVALID_FRAME),
-            b"bad frame",
-        );
-
-        let expected = [
-            SessionEvent::BeginHeaders {
-                stream_id: 1,
-                category: HeadersCategory::RESPONSE,
-            },
-            SessionEvent::Header {
-                stream_id: 1,
-                name: b":status".to_vec(),
-                value: b"200".to_vec(),
-                flags: 0,
-            },
-            SessionEvent::DataChunk {
-                stream_id: 1,
-                flags: FrameFlags::END_STREAM.bits(),
-                data: b"hello".to_vec(),
-            },
-            SessionEvent::GoAway {
-                last_stream_id: 7,
-                error_code: ErrorCode::CANCEL,
-                opaque_data: b"seen".to_vec(),
-            },
-            SessionEvent::Ping {
-                ack: false,
-                opaque_data: *b"pingpong",
-            },
-            SessionEvent::SettingsAck,
-            SessionEvent::WindowUpdate {
-                stream_id: 3,
-                increment: 4096,
-            },
-            SessionEvent::FrameRecv {
-                frame_type: FrameType::DATA,
-                flags: 0,
-                stream_id: 5,
-            },
-            SessionEvent::FrameSend {
-                frame_type: FrameType::WINDOW_UPDATE,
-                flags: 0,
-                stream_id: 3,
-            },
-            SessionEvent::StreamClose {
-                stream_id: 9,
-                error_code: ErrorCode::CANCEL,
-            },
-            SessionEvent::Error {
-                code: NgHttp2Error::from_raw(NGHTTP2_ERR_INVALID_FRAME),
-                message: b"bad frame".to_vec(),
-            },
-        ];
-
-        assert_eq!(collector.len(), expected.len());
-        for (index, event) in expected.iter().enumerate() {
-            assert_eq!(
-                collector.next_event().as_ref(),
-                Some(event),
-                "event {index} out of order"
-            );
-        }
-        assert_eq!(collector.next_event(), None);
-        assert!(collector.is_empty());
-    }
-
-    #[test]
-    fn goaway_without_opaque_data_and_settings_without_ack() {
-        let mut collector = EventCollector::new();
-        let mut ctx = test_ctx();
-
-        let goaway = goaway_frame(11, NGHTTP2_NO_ERROR, core::ptr::null_mut(), 0);
-        collector.on_frame_recv(&mut ctx, &goaway);
-        collector.on_frame_recv(&mut ctx, &settings_frame(0));
-
-        assert_eq!(
-            collector.next_event(),
-            Some(SessionEvent::GoAway {
-                last_stream_id: 11,
-                error_code: ErrorCode::NO_ERROR,
-                opaque_data: Vec::new(),
-            })
-        );
-        // A SETTINGS frame without ACK is not an acknowledgement, so it stays a
-        // plain frame notification.
-        assert_eq!(
-            collector.next_event(),
-            Some(SessionEvent::FrameRecv {
-                frame_type: FrameType::SETTINGS,
-                flags: 0,
-                stream_id: 0,
-            })
-        );
-        assert_eq!(collector.next_event(), None);
-    }
-
-    #[test]
-    fn ping_ack_flag_is_reported() {
-        let mut collector = EventCollector::new();
-        let mut ctx = test_ctx();
-
-        collector.on_frame_recv(&mut ctx, &ping_frame(true, *b"abcdefgh"));
-
-        assert_eq!(
-            collector.next_event(),
-            Some(SessionEvent::Ping {
-                ack: true,
-                opaque_data: *b"abcdefgh",
-            })
-        );
-    }
-
-    #[test]
-    fn push_promise_begins_headers_for_the_promised_stream() {
-        let mut collector = EventCollector::new();
-        let mut ctx = test_ctx();
-
-        let frame = push_promise_frame(1, 2);
-        collector.on_begin_headers(&mut ctx, &frame);
-        collector.on_header(&mut ctx, &frame, b":method", b"GET", 0);
-
-        assert_eq!(
-            collector.next_event(),
-            Some(SessionEvent::BeginHeaders {
-                stream_id: 2,
-                category: HeadersCategory::REQUEST,
-            })
-        );
-        assert_eq!(
-            collector.next_event(),
-            Some(SessionEvent::Header {
-                stream_id: 2,
-                name: b":method".to_vec(),
-                value: b"GET".to_vec(),
-                flags: 0,
-            })
-        );
-        assert_eq!(collector.next_event(), None);
-    }
-
-    #[test]
-    fn pending_events_can_be_counted_and_cleared() {
-        let mut collector = EventCollector::default();
-        assert!(collector.is_empty());
-        assert_eq!(collector.len(), 0);
-        assert_eq!(collector.next_event(), None);
-
-        collector.events.push_back(SessionEvent::SettingsAck);
-        collector.events.push_back(SessionEvent::SettingsAck);
-        assert!(!collector.is_empty());
-        assert_eq!(collector.len(), 2);
-
-        assert_eq!(collector.next_event(), Some(SessionEvent::SettingsAck));
-        assert_eq!(collector.len(), 1);
-
-        collector.clear();
-        assert!(collector.is_empty());
-        assert_eq!(collector.len(), 0);
-        assert_eq!(collector.next_event(), None);
-    }
-}
+#[cfg(test)]
+#[path = "../tests/support/event_limits.rs"]
+mod limits_tests;
