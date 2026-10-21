@@ -22,9 +22,12 @@ pub type RawErrorCode = nghttp2_error;
 pub type RawStreamError = nghttp2_error_code;
 
 /// Returns whether a native error code makes the session unusable.
+///
+/// Mirrors upstream `nghttp2_is_fatal`: only codes strictly below
+/// `NGHTTP2_ERR_FATAL` are fatal; the `NGHTTP2_ERR_FATAL` value itself is not.
 #[must_use]
 pub const fn is_fatal(code: RawErrorCode) -> bool {
-    code <= NGHTTP2_ERR_FATAL
+    code < NGHTTP2_ERR_FATAL
 }
 
 /// Returns whether a native error code asks the caller to retry later.
@@ -42,8 +45,9 @@ mod tests {
 
     #[test]
     fn fatal_codes_stop_the_session() {
-        assert!(is_fatal(nghttp2_sys::NGHTTP2_ERR_FATAL));
+        assert!(!is_fatal(NGHTTP2_ERR_FATAL));
         assert!(is_fatal(nghttp2_sys::NGHTTP2_ERR_NOMEM));
+        assert!(is_fatal(nghttp2_sys::NGHTTP2_ERR_CALLBACK_FAILURE));
         assert!(!is_fatal(nghttp2_sys::NGHTTP2_ERR_INVALID_ARGUMENT));
         assert!(!is_fatal(0));
     }

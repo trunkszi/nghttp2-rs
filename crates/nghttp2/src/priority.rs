@@ -1,9 +1,10 @@
 //! RFC 9218 extensible priorities.
 //!
 //! `nghttp2_extpri` carries an urgency level in `0..=7` (0 is most urgent) and an
-//! incremental-delivery flag. The C library parses `priority` header values with
-//! `nghttp2_extpri_parse_priority` and packs the pair into a byte with
-//! `nghttp2_extpri_to_uint8`.
+//! incremental-delivery flag. The public C API parses `priority` header values with
+//! `nghttp2_extpri_parse_priority`; the RFC 9218 byte encoding must be produced by
+//! the safe layer because the corresponding helper is private to the C
+//! implementation.
 
 pub use nghttp2_sys::{
     NGHTTP2_EXTPRI_DEFAULT_URGENCY, NGHTTP2_EXTPRI_URGENCY_HIGH, NGHTTP2_EXTPRI_URGENCY_LOW,

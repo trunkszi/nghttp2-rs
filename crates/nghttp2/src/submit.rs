@@ -6,7 +6,7 @@
 //! `NGHTTP2_ERR_DEFERRED` and resume from another callback.
 //!
 //! This module exposes the native provider and data-source types that the safe
-//! submission API wraps.
+//! submission API will wrap.
 
 pub use nghttp2_sys::{nghttp2_data_provider2, nghttp2_data_source};
 

@@ -6,7 +6,7 @@
 //! when the buffer is no longer needed.
 //!
 //! This module names the opaque native type and the borrowed view returned by
-//! `nghttp2_rcbuf_get_buf`; the RAII wrapper builds on them.
+//! `nghttp2_rcbuf_get_buf`; the RAII wrapper will build on them.
 
 pub use nghttp2_sys::nghttp2_rcbuf;
 
@@ -23,7 +23,7 @@ pub type RawBufferView = nghttp2_sys::nghttp2_vec;
 ///
 /// # Safety
 ///
-/// `rcbuf` must be a live pointer obtained from `nghttp2`.
+/// `rcbuf` must be a live, non-null pointer obtained from `nghttp2`.
 #[must_use]
 pub unsafe fn is_static(rcbuf: *const RawRcBuf) -> bool {
     // SAFETY: the caller guarantees a live nghttp2-managed buffer.

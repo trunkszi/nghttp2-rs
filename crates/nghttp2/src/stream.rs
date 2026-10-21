@@ -1,9 +1,10 @@
 //! Stream introspection.
 //!
 //! `nghttp2_stream` is an opaque handle returned by `nghttp2_session_find_stream`.
-//! It exposes the stream identifier, protocol state, and flow-control windows
-//! without transferring ownership; the handle becomes invalid when the session is
-//! destroyed or the stream is removed.
+//! It identifies a stream without transferring ownership. Except for the root
+//! stream (ID 0), a returned handle is valid only until the next call to
+//! `nghttp2_session_send`, `nghttp2_session_mem_send2`, `nghttp2_session_recv`, or
+//! `nghttp2_session_mem_recv2`.
 //!
 //! Queries through a stream handle are read-only and do not affect the session's
 //! scheduling decisions.

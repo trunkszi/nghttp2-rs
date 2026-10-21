@@ -28,7 +28,7 @@ pub const NO_COPY_FLAGS: RawHeaderFlags =
 /// The name and value point at bytes embedded in the binary, so the descriptor
 /// remains valid for the lifetime of the process and needs no cleanup. The fields
 /// are `*mut` only because `nghttp2_nv` declares them that way; the buffers must
-/// never be written through.
+/// never be written through, and the library never frees them under `NO_COPY`.
 #[must_use]
 pub fn method_post() -> RawHeaderField {
     let (name, value) = nghttp2_macros::nv!(":method", "POST");

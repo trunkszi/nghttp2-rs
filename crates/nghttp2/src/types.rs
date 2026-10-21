@@ -19,12 +19,14 @@ pub type SettingsValue = u32;
 /// Native frame header shared by every frame type.
 pub type FrameHeader = nghttp2_sys::nghttp2_frame_hd;
 
-/// Converts a stream identifier into its on-wire unsigned representation.
+/// Masks a non-negative stream identifier for on-wire frame fields.
 ///
-/// The most significant bit is reserved and always clear on the wire.
+/// Stream identifiers are positive; the `-1` value used by submission functions to
+/// request a new stream is a sentinel and has no wire encoding. The most
+/// significant bit is reserved and always clear on the wire.
 #[must_use]
-pub const fn stream_id_bits(stream_id: StreamId) -> u32 {
-    (stream_id as u32) & 0x7fff_ffff
+pub const fn stream_id_bits(stream_id: u32) -> u32 {
+    stream_id & 0x7fff_ffff
 }
 
 #[cfg(test)]
@@ -35,7 +37,7 @@ mod tests {
     fn stream_id_bits_clear_the_reserved_bit() {
         assert_eq!(stream_id_bits(0), 0);
         assert_eq!(stream_id_bits(1), 1);
-        assert_eq!(stream_id_bits(i32::MAX), 0x7fff_ffff);
-        assert_eq!(stream_id_bits(-1), 0x7fff_ffff);
+        assert_eq!(stream_id_bits(0x7fff_ffff), 0x7fff_ffff);
+        assert_eq!(stream_id_bits(u32::MAX), 0x7fff_ffff);
     }
 }
