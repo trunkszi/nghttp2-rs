@@ -149,10 +149,11 @@ impl<'a> HeaderField<'a> {
     /// them that way. The bytes behind them are never written through, and the
     /// library does not free them while the `NO_COPY` flags are set.
     ///
-    /// The descriptor borrows the field's bytes. [`METHOD_POST`] and every `nv!`
-    /// product point into the binary; a caller-owned buffer must stay alive and
-    /// unmodified until the frame is sent or abandoned, because submission only
-    /// queues the pointers.
+    /// The descriptor borrows bytes. Each `NO_COPY` flag retains its buffer until
+    /// the frame is sent or rejected; that buffer must stay alive and unmodified.
+    /// Without that flag, submission copies its bytes during the call. Static
+    /// literals never expire; moving a `Vec` or `OwnedHeader` preserves its heap
+    /// allocation, while dropping, replacing or reallocating buffers invalidates pointers.
     pub const fn as_raw(&self) -> RawHeaderField {
         RawHeaderField {
             name: self.name.as_ptr().cast_mut(),
@@ -320,10 +321,11 @@ impl OwnedHeader {
 
     /// Builds the raw descriptor that `nghttp2` submission calls expect.
     ///
-    /// The descriptor points into this header's buffers, so `self` must outlive
-    /// the queued frame: dropping it or moving a vector after submission leaves
-    /// nghttp2 with dangling pointers. The `*mut` fields are never written
-    /// through, and the library does not free the buffers under `NO_COPY`.
+    /// Moving this owner preserves its heap-buffer addresses. With `NO_COPY`,
+    /// the retained buffers must stay alive and unmodified until the frame is
+    /// sent or rejected; dropping, replacing, or reallocating them invalidates
+    /// the pointers. Without `NO_COPY`, submission copies the bytes and only
+    /// requires them during that call. Native code never writes through these pointers.
     pub fn as_raw(&self) -> RawHeaderField {
         self.as_field().as_raw()
     }

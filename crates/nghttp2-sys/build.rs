@@ -307,6 +307,58 @@ fn build_static_library(source: &Path) -> PathBuf {
         .build()
 }
 
+fn track_native_inputs(source: &Path) {
+    for relative in [
+        "CMakeLists.txt",
+        "CMakeOptions.txt",
+        "cmakeconfig.h.in",
+        "cmake",
+        "lib",
+    ] {
+        println!("cargo:rerun-if-changed={}", source.join(relative).display());
+    }
+}
+
+fn detect_outbound_queue_setter(install: &Path, out: &Path) {
+    println!("cargo:rustc-check-cfg=cfg(nghttp2_has_max_outbound_queue_size)");
+    // Compile and link against the resolved headers and archive; never execute
+    // this target binary, including when cross-compiling.
+    let probe = out.join("outbound_queue_capability.c");
+    fs::write(
+        &probe,
+        "#define NGHTTP2_STATICLIB\n#include <nghttp2/nghttp2.h>\nint main(void) {\nvoid \
+         (*setter)(nghttp2_option *, size_t) = \
+         &nghttp2_option_set_max_outbound_queue_size;\nsetter(NULL, 0); return 0; }\n",
+    )
+    .expect("write outbound queue capability probe");
+    let compiler = cc::Build::new().get_compiler();
+    let mut command = compiler.to_command();
+    command.current_dir(out);
+    let executable = out.join("outbound_queue_capability");
+    if compiler.is_like_msvc() {
+        command.arg("/I").arg(install.join("include"));
+        command.arg(format!("/Fe{}", executable.display()));
+    } else {
+        command.arg("-I").arg(install.join("include"));
+        command.arg("-o").arg(&executable);
+    }
+    let archive = ["lib", "lib64"]
+        .into_iter()
+        .map(|dir| install.join(dir).join("libnghttp2.a"))
+        .find(|path| path.is_file())
+        .expect("installed static archive");
+    if command
+        .arg(probe)
+        .arg(archive)
+        .output()
+        .expect("probe outbound queue setter")
+        .status
+        .success()
+    {
+        println!("cargo:rustc-cfg=nghttp2_has_max_outbound_queue_size");
+    }
+}
+
 fn parse_integer_literal(value: &str) -> Option<i128> {
     let value = value.trim().trim_end_matches(',');
     let (negative, digits) = match value.strip_prefix('-') {
@@ -705,12 +757,10 @@ fn main() {
     let manifest = PathBuf::from(env::var("CARGO_MANIFEST_DIR").expect("CARGO_MANIFEST_DIR"));
     let out_dir = PathBuf::from(env::var("OUT_DIR").expect("OUT_DIR"));
     let source = resolve_source(&manifest, &out_dir);
-    println!(
-        "cargo:rerun-if-changed={}",
-        source.join(PUBLIC_HEADER).display()
-    );
+    track_native_inputs(&source);
 
     let install_dir = build_static_library(&source);
+    detect_outbound_queue_setter(&install_dir, &out_dir);
     let (version, version_num) =
         parse_version_header(&install_dir.join("include/nghttp2/nghttp2ver.h"));
     let bindings = assemble_bindings(&manifest, &version, version_num);

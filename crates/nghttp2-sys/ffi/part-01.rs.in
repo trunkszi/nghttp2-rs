@@ -187,6 +187,7 @@ unsafe extern "C" {
     pub fn nghttp2_option_set_glitch_rate_limit(option: *mut nghttp2_option, burst: u64, rate: u64);
 }
 unsafe extern "C" {
+    #[cfg(nghttp2_has_max_outbound_queue_size)]
     pub fn nghttp2_option_set_max_outbound_queue_size(option: *mut nghttp2_option, val: usize);
 }
 unsafe extern "C" {
