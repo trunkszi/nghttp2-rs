@@ -1,9 +1,10 @@
 //! Safe, single-threaded HTTP/2 client and server sessions over `nghttp2`.
 //!
-//! The crate is organized into modules for a non-owning [`context`] view of an
-//! `nghttp2_session` and a user-supplied [`callbacks`] handler. Splitting those
-//! roles will let handlers submit frames and inspect stream state while the C
-//! library is iterating over them, without aliasing the handler's mutable borrow.
+//! [`Session`] owns the native connection and its [`SessionHandler`]. Transport
+//! code drives the connection through the sans-I/O send/receive loop. Callbacks
+//! receive a non-owning [`SessionCtx`] to submit frames and inspect stream state.
+//! [`EventCollector`] provides queued [`SessionEvent`] values for applications
+//! that prefer polling over a custom handler.
 //!
 //! Modules mirror the C API surface:
 //!
@@ -29,4 +30,18 @@ pub mod stream;
 pub mod submit;
 pub mod types;
 
+pub use callbacks::SessionHandler;
+pub use context::SessionCtx;
+pub use error::{Error, ErrorKind, Result};
+pub use event::{EventCollector, SessionEvent};
+pub use hpack::{HpDeflater, HpInflater, HpackHeader};
+pub use mem::CustomAllocator;
 pub use nghttp2_sys as sys;
+pub use nv::{HeaderField, NvFlags, OwnedHeader, nv};
+pub use option::SessionOptions;
+pub use priority::ExtPri;
+pub use rcbuf::RcBuf;
+pub use session::{Client, ClientSession, Server, ServerSession, Session};
+pub use stream::{SessionStreams, StreamRef};
+pub use submit::{DataPoll, DataProvider, DataSource, SessionSubmit, SettingsEntry};
+pub use types::{ErrorCode, FrameFlags, FrameType, SettingsId};
