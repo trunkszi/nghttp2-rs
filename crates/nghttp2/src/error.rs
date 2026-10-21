@@ -1,6 +1,6 @@
 //! Native error codes and their recovery classification.
 //!
-//! `nghttp2` reports failures as negative integers. Codes at or below
+//! `nghttp2` reports failures as negative integers. Codes strictly below
 //! [`NGHTTP2_ERR_FATAL`] leave the session unusable and it must be destroyed.
 //! Other negative codes are ordinary protocol, stream, or argument errors that the
 //! caller can report and recover from. Three values describe a temporary state

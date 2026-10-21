@@ -3,7 +3,7 @@
 //! An [`nghttp2_nv`] is a borrowed view. The name and value pointers must remain
 //! valid until `nghttp2` has finished encoding the frame that references them. The
 //! `NO_COPY` flags let callers keep ownership of the buffers; with those flags
-//! clear the library copies the bytes into its own HPACK workspace.
+//! clear the library copies the bytes into a single allocation owned by the frame.
 //!
 //! The `nv!` macro in `nghttp2-macros` produces static byte strings suitable for
 //! the zero-copy path.

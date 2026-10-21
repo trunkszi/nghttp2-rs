@@ -19,6 +19,9 @@ pub type RawStreamState = nghttp2_sys::nghttp2_stream_proto_state;
 
 /// Returns the numeric stream identifier, or `0` for a null handle.
 ///
+/// A null handle and the root stream both report `0`; callers that need to tell
+/// them apart must test the pointer before calling this function.
+///
 /// # Safety
 ///
 /// `stream` must be null or a live handle owned by a session.

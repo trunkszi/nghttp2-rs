@@ -14,7 +14,8 @@ pub use nghttp2_sys::nghttp2_session_callbacks;
 /// Opaque native callback table.
 pub type RawSessionCallbacks = nghttp2_session_callbacks;
 
-/// Native callback failure code returned after a caught Rust panic.
+/// Native callback failure code that trampolines must return after a caught
+/// Rust panic.
 pub const CALLBACK_FAILURE: i32 = nghttp2_sys::NGHTTP2_ERR_CALLBACK_FAILURE;
 
 /// Native transport send callback.
