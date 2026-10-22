@@ -1,0 +1,31 @@
+[package]
+name = "nghttp2"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+description = "Safe, single-threaded HTTP/2 client and server sessions over nghttp2"
+
+[lib]
+bench = false
+
+[features]
+default = ["pre-release"]
+pre-release = ["nghttp2-sys/pre-release"]
+stable = ["nghttp2-sys/stable"]
+
+[dependencies]
+thiserror = { workspace = true }
+nghttp2-sys = { workspace = true }
+nghttp2-macros = { workspace = true }
+
+[dev-dependencies]
+anyhow = { workspace = true }
+
+[lints]
+workspace = true
+
+[[bench]]
+name = "h2_bench"
+harness = false
